@@ -28,6 +28,10 @@
 //! - [`file_search`] — the `@` picker's pure primitives (token detection,
 //!   fuzzy match, ranking).
 //! - [`frame`]       — frame scheduling: coalesce redraw requests, 120 fps cap.
+//! - [`herdr`]       — herdr support: inside a herdr pane, the session's
+//!   working/blocked/idle state reported to the multiplexer's socket — the
+//!   activation rules, the state derivation, the change check, the requests,
+//!   and the worker that sends them (see `docs/herdr.md`).
 //! - [`frontmatter`] — the `---` YAML frontmatter parse a `SKILL.md` and an
 //!   agent definition share: the block split, its scalars, the listing trim
 //!   (pure; see `docs/skills.md`, `docs/subagents.md`).
@@ -143,6 +147,7 @@ pub mod file_search;
 pub mod frame;
 pub mod frontmatter;
 pub mod git_diff;
+pub mod herdr;
 pub mod highlight;
 pub mod history;
 pub mod hooks;

@@ -203,6 +203,7 @@ The footer shows your active model, thinking mode, speed tier and context usage.
 - **Inline images.** Paste screenshots with **Ctrl+V**. Images render natively in kitty, iTerm2, and sixel terminals, with a character-based fallback elsewhere.
 - **Inspect the session.** **Ctrl+O** opens the expanded transcript; **Ctrl+D** shows the context sent to the model. Start a line with `!` for a shell command or use `@` to pick a file.
 - **Live customisation.** Preview eleven themes with `/theme`, six mascots with `/mascot`, and nine spinner styles with `/spinner`. `/settings` brings the remaining controls together in a searchable menu.
+- **Works with herdr.** Inside a [herdr](https://herdr.dev) pane, the sidebar shows when Alter Zero is working, waiting on you, or done — with no setup.
 
 ## Commands & shortcuts
 

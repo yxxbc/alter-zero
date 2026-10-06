@@ -165,6 +165,10 @@ pub fn spawn_in(
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave.try_clone()?));
         apply_terminal_env(&mut cmd);
+        // The tier walk's rule (`subprocess`), for the same reason: an
+        // alter-zero run in this terminal is nested under a session already
+        // reporting to herdr (docs/herdr.md *Nested sessions*).
+        crate::herdr::stamp_child(&mut cmd);
         match cmd.spawn() {
             Ok(child) => {
                 // Our copies of the slave go now — the `Command`'s three with

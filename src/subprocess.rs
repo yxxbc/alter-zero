@@ -340,6 +340,9 @@ fn spawn_tiers(
     let (last, rest) = order.split_last().expect("tiers is never empty");
     let build = |tier: &DetachTier<'_>| {
         let mut cmd = command_in(tier, shell, command);
+        // A shell child of a session reporting to herdr says so, so an
+        // alter-zero it runs stays quiet (docs/herdr.md *Nested sessions*).
+        crate::herdr::stamp_child(&mut cmd);
         configure(&mut cmd);
         cmd
     };

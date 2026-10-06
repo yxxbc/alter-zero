@@ -521,6 +521,10 @@ impl<'t> Session<'t> {
             update_attempted: None,
             update_notice_pending: None,
             _file_worker: file_worker,
+            // Read once: outside herdr this is `None` and nothing is spawned
+            // (docs/herdr.md). Inside it, starting here — before any turn can
+            // spawn a shell — marks every shell child as the pane's.
+            herdr: super::herdr::HerdrLink::from_env(),
             registry,
             agent_registry,
             steer,
@@ -590,6 +594,10 @@ impl<'t> Session<'t> {
         if let Some(prompt) = prompt {
             session.submit_startup_prompt(prompt);
         }
+        // Tell herdr the pane runs alter-zero (docs/herdr.md): idle, or
+        // working when the [PROMPT] above started the first turn — and, for
+        // a resumed conversation, the command that reopens it.
+        session.herdr_tick();
 
         Ok(session)
     }
@@ -931,6 +939,9 @@ impl<'t> Session<'t> {
         if let Some(mcp) = &self.mcp {
             mcp.shutdown();
         }
+        // Hand the herdr pane back (docs/herdr.md) — the last thing sent, its
+        // wait bounded so a wedged herdr cannot hang the quit.
+        self.release_herdr();
         // The exit hint's handle (docs/cli.md): the active rollout's id, only when
         // this session holds a conversation — an empty session has no file and no
         // id (deferred create), and a `/clear`ed-then-idle one no history, so
@@ -944,7 +955,7 @@ impl<'t> Session<'t> {
     /// The loop-bottom bookkeeping, run after every event: the auto-compact check,
     /// the abandoned-permission release, the three on-disk mirrors (the
     /// rollout, the input history, the tip walk's position), the transcript
-    /// pre-render, and the detached-thread sweep.
+    /// pre-render, the detached-thread sweep, and the herdr state report.
     pub(crate) fn after_iteration(&mut self) {
         // Auto-compact (docs/compact.md): past codex's 90%-of-window threshold,
         // start the summarization turn on our own at this idle boundary — the loop
@@ -1002,6 +1013,11 @@ impl<'t> Session<'t> {
         // loop; a thread still parked in its final network read is left until it
         // exits on its own. See `Session::abandon_inflight` / docs/interrupt.md.
         self.reaping.retain(|handle| !handle.is_finished());
+        // Last, once everything above has settled the iteration — a chained
+        // or auto-started turn, a released prompt, the rollout (and its id)
+        // materialized by the sync: tell herdr if the session's state changed
+        // (docs/herdr.md). A few compares and no I/O when it did not.
+        self.herdr_tick();
     }
 
     /// Write the spinner tip walk's position back to the per-user

@@ -185,12 +185,12 @@ pays for and why (`moxcms` under `image`, the sixel quantiser under
 ## Architecture
 
 A **library** (`src/lib.rs` → `app`, `stream`, `ui`, `term`, `frame`, `paste`,
-`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `cli`, `links`, `images`) holds the logic; **`src/main.rs`** is a 77-line shell —
+`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `cli`, `links`, `images`, `herdr`) holds the logic; **`src/main.rs`** is a 77-line shell —
 the detached-exec hook, the CLI resolution, the viewport, the loop — over
 **`src/tui/`**, the binary-private tree that drives the codex-style **async
 (tokio) `select!`** loop (`event_loop`, `actions`, `turn`, `stream`, `agent`,
 `background`, `permission`, `ask`, `view`, `commit`, `models`, `config`, `bootstrap`,
-`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
+`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `herdr`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
 with the **`Session`** struct itself in `mod.rs` — every handler is an `impl
 Session` block in its area module, reaching the private fields the way `app/`'s
 submodules reach `App`'s). The four big ones are **directories
@@ -263,7 +263,23 @@ that history in `docs/history-search.md`; the **cross-session persistence** of
 that input history (an on-disk `history.jsonl` seeding `App::input_history` at
 startup, so ↑/↓ recall *and* Ctrl+R span sessions) in
 `docs/history-persistence.md`; the `!` local shell commands in
-`docs/shell-command.md`; the `?` shortcuts band in
+`docs/shell-command.md`; the **herdr** integration (inside a
+[herdr](https://herdr.dev) pane the session reports its own
+`working`/`blocked`/`idle` state to the multiplexer's socket — no hooks, no
+setup — derived from `App` by the pure `herdr::status_of` (blocked on an open
+permission prompt or question, working on a turn **or a still-running
+background agent**, whose completion starts its own follow-up turn), reported
+change-only from the loop bottom (`herdr::Tracker`, after every way a turn can
+start or end has settled the iteration), numbered by a nanosecond clock herdr
+orders across restarts, sent one request per connection by a worker thread
+(`herdr::Reporter`: a backlog collapsed to its newest, the release last — at
+quit and on drop, so an error exit still hands the pane back), each report
+carrying `alter-zero --resume {id}` once the conversation is recorded and the
+name resolves on `PATH`; every shell child is stamped
+`ALTER_ZERO_HERDR_REPORTER={pane}` at the two spawn choke points (the marker
+rides the child commands because `set_var` is `unsafe` in edition 2024) so a
+nested alter-zero stays quiet; `ALTER_ZERO_HERDR=0` turns it off; `smoke.sh`
+Phase 132) in `docs/herdr.md`; the `?` shortcuts band in
 `docs/shortcuts.md`; the Shift+Enter / Ctrl+J newline keys in
 `docs/shift-enter.md`; the mid-turn message queue — and its **delivery into the
 running turn** at the next round boundary, main session and subagent session

@@ -48,6 +48,7 @@
 //! | [`telemetry`] | The once-a-day anonymous usage ping (once more on the day of an update): the install id, the notice, the send, the recorded day and version (`docs/telemetry.md`). |
 //! | [`update`] | The once-a-day update check: the request, the card under the banner, the recorded day (`docs/update.md`). |
 //! | [`update_cli`] | The `alter-zero update` subcommand: the check, then the one-line installer over this binary (`docs/update.md`). |
+//! | [`herdr`] | Reporting the session's state to the herdr terminal multiplexer: the link read from the pane's environment, the loop-bottom report, the release on quit (`docs/herdr.md`). |
 //! | [`history_store`] | The cross-session input history (`docs/history-persistence.md`). |
 //! | [`shell`] | The `!` command runner (`docs/shell-command.md`). |
 //! | [`workers`] | The off-thread file-search / clipboard / model-list jobs. |
@@ -89,6 +90,7 @@ pub(crate) mod donate;
 pub(crate) mod event_loop;
 pub(crate) mod export;
 pub(crate) mod git_diff_loader;
+pub(crate) mod herdr;
 pub(crate) mod history_store;
 pub(crate) mod host;
 pub(crate) mod login;
@@ -271,6 +273,12 @@ pub(crate) struct Session<'t> {
     /// The `@` file-search worker's handle, kept so the thread's lifetime is
     /// tied to the session's. Never joined.
     _file_worker: JoinHandle<()>,
+    /// The herdr pane this session reports its state to (`docs/herdr.md`):
+    /// `None` outside herdr, or with `ALTER_ZERO_HERDR=0`. The loop bottom
+    /// feeds it ([`Session::herdr_tick`]) and the quit releases it
+    /// ([`Session::release_herdr`]); dropping it releases too, so a loop that
+    /// bails out on an error still hands the pane back.
+    herdr: Option<herdr::HerdrLink>,
 
     // ----- registries, the gate, the stores -----
     /// Background shells: the `run_in_background` launches, Ctrl+B hand-offs,

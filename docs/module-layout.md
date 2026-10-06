@@ -139,6 +139,7 @@ opening the viewport, running the loop — and everything else lives here:
 | `startup.rs` | The `--continue`/`--resume`/`[PROMPT]` argument resolution, the styled `--help` / usage-error printing, and the `mcp` / `update` subcommand dispatch (`docs/cli.md`). |
 | `recorder.rs` | `SessionRecorder`: mirroring history to a rollout file (`docs/resume.md`). |
 | `resume.rs` | Finding recorded sessions on disk, and the `/resume` + backtrack arms. |
+| `herdr.rs` | Reporting the session's state to the herdr terminal multiplexer: the link read once from the pane's environment, the change-only report at the loop bottom, the release on quit (`docs/herdr.md`). |
 | `history_store.rs` | `InputHistoryStore` (`docs/history-persistence.md`). |
 | `mascot.rs` | Applying a `/mascot` selection: the per-directory `mascot.json` write + banner repaint (`docs/mascot.md`). |
 | `spinner.rs` | Applying a `/spinner` selection: the per-directory `spinner.json` write + toast (`docs/spinner.md`). |

@@ -14,6 +14,16 @@ release heading when a version is cut.
 
 ### Added
 
+- **Alter Zero now reports its state to herdr natively.** Run inside a
+  [herdr](https://herdr.dev) pane, the session tells the multiplexer whether
+  it is working, waiting on you or ready, with nothing to install or
+  configure. The pane's sidebar row, herdr's done marker and its notifications
+  follow the session exactly. A permission prompt or a question shows the
+  pane as blocked, naming what it asks. A background agent still running
+  keeps it working until the work it started is finished. Quitting hands the
+  pane back. Once a conversation is recorded, herdr can reopen it with
+  `alter-zero --resume` after a restart. `ALTER_ZERO_HERDR=0` turns it off
+  (`docs/herdr.md`).
 - **A built-in `yt-dlp` skill guides media downloads without bundling a downloader.**
   On first launch its editable `SKILL.md` is seeded beside the other built-ins;
   the agent can load it on demand for videos, playlists, captions and audio.
