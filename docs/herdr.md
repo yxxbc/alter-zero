@@ -37,12 +37,31 @@ an agent herdr doesn't ship support for:
    the process-name matching and which manifests load are compiled into
    herdr (a local manifest only *patches* an agent herdr already knows), and
    the project does not take unsolicited pull requests.
-2. **Hooks.** A user could point Alter Zero's own `hooks.json` at a script
-   calling `herdr pane report-agent`. It cannot see the
-   `AskUserQuestion` modal (no hook event fires while it is open), cannot
-   tell when a permission prompt was *answered*, knows nothing of
-   background subagents, and costs every user an opt-in per directory
-   (`docs/hooks.md`) and a script to maintain.
+2. **Hooks.** Claude Code's own herdr integration is a `SessionStart` hook,
+   but copied as it is it would do nothing here: it reports only the
+   session's id, which herdr ignores from any source but its own
+   integrations, and Claude's *state* comes from herdr reading Claude's
+   screen against a manifest Alter Zero has none of. A script of our own,
+   calling `herdr pane report-agent` from Alter Zero's `hooks.json`, covers
+   the happy path — `UserPromptSubmit` → working, `PermissionRequest` and a
+   `PreToolUse` on `AskUserQuestion` → blocked, `Stop` → idle, `SessionEnd`
+   → release — and misses the rest:
+   - `Stop` fires only when a round completes, never on an Esc interrupt, a
+     backend error, a `/compact` turn or a `!` command, so after any of
+     those the pane reads `working` until some later turn ends;
+   - nothing fires when a permission prompt is *answered*: `PostToolUse`
+     comes only after the call succeeds, so an approved two-minute build
+     reads `blocked` for two minutes, and a refused call stays `blocked`
+     until the model's next call;
+   - nothing fires at launch (`SessionStart` waits for the first turn), for
+     a `!` command or for a summarization, and a hook process cannot know a
+     background subagent is still running when the lead's `Stop` arrives;
+   - the payload's `session_id` is not the id `--resume` takes (the rollout
+     mints its own when its file is created), so the resume command would
+     have to be parsed out of `transcript_path`;
+   - hooks are off until a directory turns them on (`docs/hooks.md`), so
+     every user installs a script and opts in per project, and each
+     `PreToolUse`/`PostToolUse` spawns a process the turn waits on.
 3. **Self-reporting** — herdr's documented path for a third-party agent
    ("Add Herdr support to your agent", herdr.dev/docs/add-herdr-support):
    the agent reports its own state, its resume command and its release
