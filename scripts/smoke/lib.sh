@@ -94,6 +94,10 @@ smoke_sanitize_env() {
 	# native arboard path wins, the OSC 52 fallback they read back never fires,
 	# and the suite overwrites the developer's real clipboard on its way past.
 	unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
+	# A developer running the suite inside a herdr pane would otherwise have
+	# every test session report its state against that pane, and release it
+	# on the way out (docs/herdr.md). The herdr phase (132) sets its own.
+	unset HERDR_ENV HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_BIN_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION
 	# Telemetry (docs/telemetry.md) is opt-out and pings a real collector once
 	# a day per config home — off for the suite, both exported (the tmux
 	# server inherits it) and spelled out in every launch string.

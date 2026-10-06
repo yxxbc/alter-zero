@@ -703,6 +703,13 @@ pub(crate) fn permissions_enabled() -> bool {
     env_flag("ALTER_ZERO_PERMISSIONS")
 }
 
+/// The herdr pane this session reports its state to: `Some` when herdr's own
+/// variables say it runs in one and `ALTER_ZERO_HERDR` does not turn the
+/// report off (`docs/herdr.md`). Read once, at startup.
+pub(crate) fn herdr_pane() -> Option<alter_zero::herdr::Pane> {
+    alter_zero::herdr::Pane::from_env(|name| std::env::var(name).ok())
+}
+
 /// A feature toggle read from the environment: **on** unless `name` is set to
 /// one of `0`/`false`/`no`/`off` (case- and whitespace-insensitive). The one
 /// grammar every `ALTER_ZERO_*` on/off flag uses.

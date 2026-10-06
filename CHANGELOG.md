@@ -20,6 +20,18 @@ release heading when a version is cut.
   It checks installed CLI tools and available formats, defaults to one video
   unless a playlist was requested, asks before using browser cookies and
   verifies output files before reporting success (`docs/skills.md`).
+- **Alter Zero now reports its state to herdr.** Run it inside a
+  [herdr](https://herdr.dev) pane and herdr's sidebar shows `alter-zero` as
+  working while a turn or a subagent runs, blocked while a permission prompt
+  or a question waits on you (or after a turn that failed), and idle or done
+  when it is ready, with herdr's own toasts and sounds on each change and
+  `herdr agent wait` working on the pane. After a herdr restart the pane
+  comes back running `alter-zero --resume` on the same conversation, and
+  quitting releases the pane at once. There is nothing to set up: it starts
+  only when herdr's variables say the session runs in a herdr pane, and
+  `ALTER_ZERO_HERDR=0` turns it off. Inside herdr, Ctrl+B is herdr's prefix,
+  so moving a command to the background takes Ctrl+B twice
+  (`docs/herdr.md`).
 
 ### Fixed
 

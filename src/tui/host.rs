@@ -111,6 +111,18 @@ pub(crate) fn session_id() -> String {
     format!("{nanos:x}-{:x}", std::process::id())
 }
 
+/// Milliseconds since the epoch — the clock herdr's report sequence numbers
+/// are drawn from (`herdr::next_seq`, `docs/herdr.md`). A clock before 1970
+/// reads as 0, which the sequence survives: it counts on from its last
+/// number.
+pub(crate) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Today's UTC date, `YYYY-MM-DD` — the key the daily telemetry ping is
 /// throttled on (`telemetry::should_ping`). UTC rather than local so the
 /// client's day and the collector's agree except around midnight, where a

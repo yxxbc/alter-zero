@@ -694,6 +694,19 @@ which Ctrl+V reads the clipboard from.
   the two conversation-level additions are `StreamEvent::HookNote` → the
   cell-less `HistoryItem::HookNote` (transcript-visible, context-replayed
   verbatim, `/resume`-safe) and the terminal `StreamEvent::PromptBlocked`.
+- **herdr panes** (`docs/herdr.md`): inside a [herdr](https://herdr.dev)
+  pane — `HERDR_ENV=1` with a socket and a pane id, unless
+  `ALTER_ZERO_HERDR=0` — the session reports its own state over herdr's
+  socket, since herdr recognises agents only from a compiled-in list:
+  `blocked` while a permission prompt or a question waits (with what it
+  asks), `working` while a turn or a subagent runs, `blocked` after a turn
+  that died on an error, `idle` otherwise; each report carries the
+  `alter-zero --resume {id}` command herdr reopens the pane with after a
+  restart, and a quit releases the pane. The state is *derived* — read off
+  `App` at every loop bottom and sent only on change, from a writer thread —
+  so no code path that changes it has to remember to say so. The shells the
+  model runs get `ALTER_ZERO_HERDR=0`, so an Alter Zero started inside one
+  never claims its parent's pane.
 
 ## Architecture
 
@@ -1294,8 +1307,11 @@ two places that have to agree (both now applied by every phase for itself, so
 a phase run on its own is as hermetic as one run by the suite):
 
 - **The variables.** The script unsets every `*_API_KEY`, every `ALTER_ZERO_*`
-  knob, `OLLAMA_HOST`, `NO_COLOR`, and `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`
-  before its first launch, then spells out per launch the ones it wants —
+  knob, `OLLAMA_HOST`, `NO_COLOR`, `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`, and
+  every `HERDR_*` pane variable (a developer running the suite inside herdr
+  would otherwise have each test session report against their pane,
+  `docs/herdr.md`) before its first launch, then spells out per launch the ones
+  it wants —
   exporting three switches off for every phase besides (`ALTER_ZERO_TELEMETRY`,
   `ALTER_ZERO_UPDATE_CHECK`, and `ALTER_ZERO_TIPS`, whose row under a turn's
   status line would otherwise land in every strip a phase holds past three
@@ -1485,3 +1501,10 @@ stream for their own reasons).
   collector without such a lookup records `ZZ`. The default endpoint is a
   constant that must match the deployed worker's URL, so a renamed worker or
   a fork pings nothing until `telemetry::DEFAULT_ENDPOINT` is changed.
+- **herdr reports** (`docs/herdr.md`) are sent on change only, so a herdr
+  server handed its panes live (an upgrade) shows no state for an idle
+  session until its next transition; herdr's Windows named pipe is not
+  spoken; and another agent with herdr hooks, run by the model inside a tool
+  shell, can still report against the pane while it runs, since the
+  `HERDR_*` variables are left to the shells on purpose for herdr's own
+  agent skill.

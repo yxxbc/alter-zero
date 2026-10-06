@@ -31,6 +31,10 @@
 //! - [`frontmatter`] — the `---` YAML frontmatter parse a `SKILL.md` and an
 //!   agent definition share: the block split, its scalars, the listing trim
 //!   (pure; see `docs/skills.md`, `docs/subagents.md`).
+//! - [`herdr`]       — reporting the session's state to the herdr pane it runs
+//!   in: whether it runs in one, the state a session's activity puts the pane
+//!   in, the resume command, the request lines — plus the one socket send the
+//!   writer thread calls (see `docs/herdr.md`).
 //! - [`images`]      — inline terminal images: the cell footprint a picture
 //!   takes, the per-cell carrier that reserves its rows, and the boundary
 //!   store that encodes it for whatever the terminal can draw
@@ -143,6 +147,7 @@ pub mod file_search;
 pub mod frame;
 pub mod frontmatter;
 pub mod git_diff;
+pub mod herdr;
 pub mod highlight;
 pub mod history;
 pub mod hooks;

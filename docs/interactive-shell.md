@@ -1049,7 +1049,11 @@ emulator implements) and `PAGER=cat`/`GIT_PAGER=cat`/`MANPAGER=cat`/
 nobody asked for — a program the model runs *as* a pager (`less file`) is
 unaffected. Variables that describe the TUI's *own* terminal (`TMUX`,
 `TERM_PROGRAM`, `KITTY_WINDOW_ID`, `COLUMNS`, …) are removed, since they would
-steer a program toward features the session's emulator does not have.
+steer a program toward features the session's emulator does not have. And
+`ALTER_ZERO_HERDR=0` is set: the session's terminal is not the herdr pane
+the TUI may run in, so an Alter Zero started in it must not report as that
+pane's agent (`docs/herdr.md` — the `HERDR_*` variables themselves stay, for
+herdr's own CLI).
 
 **A UTF-8 locale where the environment names none** (`spawn::utf8_locale`).
 A container, a CI job or a Docker image often sets no `LANG`, and every

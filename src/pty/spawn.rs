@@ -29,12 +29,18 @@ use super::screen::{COLUMNS, ROWS};
 /// actually has — and the pagers turned into plain printing, so `git log`,
 /// `man` or `systemctl status` print instead of waiting in a pager nobody
 /// asked for. A program run *as* a pager (`less file`) is unaffected.
-pub const TERMINAL_ENV: [(&str, &str); 5] = [
+///
+/// The terminal is also not a herdr pane, whatever the inherited `HERDR_*`
+/// variables say: an Alter Zero started in a session must not report its
+/// state as the pane's agent, so the session turns that report off
+/// (`docs/herdr.md`).
+pub const TERMINAL_ENV: [(&str, &str); 6] = [
     ("TERM", "xterm-256color"),
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
     ("MANPAGER", "cat"),
     ("SYSTEMD_PAGER", "cat"),
+    (crate::herdr::HERDR_ENV, "0"),
 ];
 
 /// Variables describing a **different** terminal — the one the TUI itself

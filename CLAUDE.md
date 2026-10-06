@@ -185,12 +185,12 @@ pays for and why (`moxcms` under `image`, the sixel quantiser under
 ## Architecture
 
 A **library** (`src/lib.rs` → `app`, `stream`, `ui`, `term`, `frame`, `paste`,
-`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `cli`, `links`, `images`) holds the logic; **`src/main.rs`** is a 77-line shell —
+`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `herdr`, `cli`, `links`, `images`) holds the logic; **`src/main.rs`** is a 77-line shell —
 the detached-exec hook, the CLI resolution, the viewport, the loop — over
 **`src/tui/`**, the binary-private tree that drives the codex-style **async
 (tokio) `select!`** loop (`event_loop`, `actions`, `turn`, `stream`, `agent`,
 `background`, `permission`, `ask`, `view`, `commit`, `models`, `config`, `bootstrap`,
-`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
+`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `herdr`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
 with the **`Session`** struct itself in `mod.rs` — every handler is an `impl
 Session` block in its area module, reaching the private fields the way `app/`'s
 submodules reach `App`'s). The four big ones are **directories
@@ -2295,6 +2295,34 @@ under a red `Can't resume on …` toast and leaving the record alone — so the
 directory's entry is only what a *new* session starts on, and two instances
 in one directory each keep, and each resume, their own model; `smoke.sh`
 Phase 118) — and so are the **`/mascot` and `/spinner` looks** (`mascot.json`/`spinner.json` each gaining `config.json`'s `projects` map over the last choice, a directory pinning that last at its first launch and a choice made in it becoming its entry *and* the last, through one pure `app::LookFile<T>` shared by the two twin catalogs via the `app::Look` trait — `tui::config::adopt_look` at bootstrap, `save_look` from the pickers' Enter, `docs/per-directory-state.md`, `smoke.sh` Phase 114).
+
+**Inside a [herdr](https://herdr.dev) pane the session reports its own state
+to herdr** (`docs/herdr.md`), since herdr — a multiplexer whose sidebar shows
+each pane's agent as blocked/working/done/idle — recognises agents only from a
+compiled-in process list and has no way to learn Alter Zero's: `blocked` while
+a permission prompt or a question waits (its `message` saying what it asks),
+`working` while a turn or a subagent runs, `blocked` after a turn that died on
+a backend error until the next turn or a replaced conversation, `idle`
+otherwise, each report carrying `resume_argv` (`alter-zero --resume {id}`, a
+bare `alter-zero` before the first message) so herdr reopens the pane as the
+same conversation after its own restart, and a bounded `pane.release_agent`
+as the last thing `shutdown` does. The state is **derived, never pushed**: the
+pure `herdr::activity` reads `App` at every loop bottom
+(`Session::herdr_tick`, after the auto-compact start and the rollout sync)
+and `herdr::Reporter` turns a *change* into a request line — the one fact
+`App` does not keep, the failed turn, handed over in the `StreamEvent::Error`
+arm and expiring with the history generation — so no code path that changes
+the state has to remember to say so; the line goes to
+`workers::spawn_herdr_reporter`'s latest-wins thread, one newline-delimited
+JSON request per connection over herdr's Unix socket, `seq` the wall clock in
+microseconds (herdr ignores a number not above the last it accepted, across
+runs). It runs only on `HERDR_ENV=1` with `HERDR_SOCKET_PATH` and
+`HERDR_PANE_ID` set, `ALTER_ZERO_HERDR=0` the off switch, writes only to a
+socket the user owns, and the model's PTY shells get `ALTER_ZERO_HERDR=0`
+(`pty::spawn::TERMINAL_ENV`) so an Alter Zero started in one never claims its
+parent's pane — the `HERDR_*` variables themselves left alone for herdr's own
+agent skill; `smoke_sanitize_env` unsets them, and `smoke.sh` Phase 132
+drives the whole contract against a stub socket.
 
 ### The runtime model and its invariants
 

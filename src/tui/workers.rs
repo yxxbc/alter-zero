@@ -20,6 +20,9 @@
 //! - [`spawn_telemetry_ping`] — the once-a-day anonymous usage ping
 //!   (`docs/telemetry.md`), fire-and-forget: it reports only success, so the
 //!   loop can record the day, and a dead collector costs the user nothing.
+//! - [`spawn_herdr_reporter`] — the herdr pane-state writer
+//!   (`docs/herdr.md`), the one long-lived worker that reports nothing
+//!   back: it sends the newest state line it holds and forgets it.
 //!
 //! **Invariant 1:** a worker only ever *sends*. None of them reads stdin, so
 //! the `EventStream` stays the single stdin reader.
@@ -291,6 +294,27 @@ pub(crate) fn spawn_telemetry_ping(
             });
         }
     });
+}
+
+/// The herdr reporter's thread (`docs/herdr.md`): one long-lived writer that
+/// sends each request line it is handed to herdr's `socket`. Only the newest
+/// line in its queue goes out — a burst of transitions queued while a write
+/// was in flight costs one write, and the sequence number each line carries
+/// is what makes dropping the older ones safe. Failures are dropped: a report
+/// is best-effort, and the loop never learns of one. The thread ends when the
+/// returned sender does. It only *writes* — never a stdin reader
+/// (invariant 1).
+pub(crate) fn spawn_herdr_reporter(socket: PathBuf) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        while let Ok(mut line) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                line = newer;
+            }
+            let _ = alter_zero::herdr::send(&socket, &line, alter_zero::herdr::SEND_TIMEOUT);
+        }
+    });
+    tx
 }
 
 /// Ask the repository for its newest release on a detached thread

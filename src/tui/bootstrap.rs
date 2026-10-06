@@ -520,6 +520,14 @@ impl<'t> Session<'t> {
             update_rx,
             update_attempted: None,
             update_notice_pending: None,
+            // The herdr pane-state report (docs/herdr.md): a reporter and its
+            // writer thread only when this process runs in a herdr pane.
+            herdr: config::herdr_pane().map(|pane| {
+                super::herdr::HerdrLink::start(
+                    pane,
+                    &alter_zero::cli::bin_name(std::env::args().next().as_deref()),
+                )
+            }),
             _file_worker: file_worker,
             registry,
             agent_registry,
@@ -590,6 +598,10 @@ impl<'t> Session<'t> {
         if let Some(prompt) = prompt {
             session.submit_startup_prompt(prompt);
         }
+        // Claim the herdr pane from the first frame (docs/herdr.md) — idle,
+        // or working when a [PROMPT] just started — rather than at whatever
+        // event first wakes the loop.
+        session.herdr_tick();
 
         Ok(session)
     }
@@ -931,6 +943,10 @@ impl<'t> Session<'t> {
         if let Some(mcp) = &self.mcp {
             mcp.shutdown();
         }
+        // Release the herdr pane (docs/herdr.md) once everything above has
+        // stopped, so nothing reports after it — bounded, so a wedged herdr
+        // cannot hold the terminal.
+        self.herdr_release();
         // The exit hint's handle (docs/cli.md): the active rollout's id, only when
         // this session holds a conversation — an empty session has no file and no
         // id (deferred create), and a `/clear`ed-then-idle one no history, so
@@ -943,8 +959,8 @@ impl<'t> Session<'t> {
 
     /// The loop-bottom bookkeeping, run after every event: the auto-compact check,
     /// the abandoned-permission release, the three on-disk mirrors (the
-    /// rollout, the input history, the tip walk's position), the transcript
-    /// pre-render, and the detached-thread sweep.
+    /// rollout, the input history, the tip walk's position), the herdr state
+    /// report, the transcript pre-render, and the detached-thread sweep.
     pub(crate) fn after_iteration(&mut self) {
         // Auto-compact (docs/compact.md): past codex's 90%-of-window threshold,
         // start the summarization turn on our own at this idle boundary — the loop
@@ -981,6 +997,12 @@ impl<'t> Session<'t> {
         // cost no I/O.
         self.recorder
             .sync(&self.app.history, self.app.history_generation());
+        // Tell herdr what the session is doing now (docs/herdr.md) — after the
+        // auto-compact start above, so a turn that ends into a summarization
+        // never shows idle between them, and after the rollout sync, so the
+        // first message's session id rides the same report. A compare and no
+        // I/O on every iteration that changed nothing.
+        self.herdr_tick();
         // Flush any inputs recorded this iteration to the persistent history file
         // (docs/history-persistence.md) — the drain is empty on iterations that
         // recorded nothing, so streaming ticks cost no I/O.
