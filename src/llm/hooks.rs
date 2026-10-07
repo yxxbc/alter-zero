@@ -49,6 +49,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// against the 600 s every other event gets.
 const BOUNDED_EVENT_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long a hook's output pipes may stay open once its process exited —
+/// time for the reader to take the last bytes, not for a process the hook
+/// left running holding them, which would hold every hook behind it on the
+/// lane for as long as it lives ([`PipeCapture::finish`]).
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 /// How long an event that ends a turn (`Interrupt`, `SessionEnd`) waits for
 /// that turn's cancelled hooks to be reaped before it runs ([`InFlight`]).
 /// A cancelled hook dies within a poll; the bound is for the case where it
@@ -771,6 +777,11 @@ impl CommandHooks {
 
     /// [`dispatch`](Self::dispatch) without waiting on the lane — what a job
     /// **on** the lane uses, since waiting there would wait on itself.
+    ///
+    /// The integration layer's handlers observe (`docs/hooks.md`
+    /// *Integrations*): they run after every other handler, and not at all
+    /// when those stopped the event from happening — a herdr pane must not
+    /// go idle on a `Stop` a hook turned into another round.
     fn dispatch_now(
         &self,
         event: HookEvent,
@@ -787,12 +798,25 @@ impl CommandHooks {
                 ..ParsedHook::default()
             })
             .collect();
-        for handler in &selection.handlers {
+        let (observers, acting): (Vec<&CommandHook>, Vec<&CommandHook>) = selection
+            .handlers
+            .iter()
+            .partition(|handler| handler.observer);
+        for handler in acting {
             if cancel.is_cancelled() {
                 break;
             }
             let run = self.run_handler(handler, payload, cancel);
             parsed.push(parse_run(&run, event));
+        }
+        if !observers.is_empty() && !merge(parsed.clone()).prevents(event) {
+            for handler in observers {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let run = self.run_handler(handler, payload, cancel);
+                parsed.push(parse_run(&run, event));
+            }
         }
         merge(parsed)
     }
@@ -853,10 +877,8 @@ impl CommandHooks {
 
         // Drain both pipes on their own threads: a handler that prints more
         // than a pipe buffer would otherwise deadlock against our wait.
-        let out_pipe = child.stdout.take();
-        let out_reader = std::thread::spawn(move || read_pipe(out_pipe));
-        let err_pipe = child.stderr.take();
-        let err_reader = std::thread::spawn(move || read_pipe(err_pipe));
+        let out_reader = PipeCapture::spawn(child.stdout.take());
+        let err_reader = PipeCapture::spawn(child.stderr.take());
 
         let deadline = Duration::from_secs(handler.timeout_secs);
         let started = Instant::now();
@@ -865,10 +887,9 @@ impl CommandHooks {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {}
                 Err(err) => {
-                    // Reap before bailing: the readers (and the writer) hold
-                    // the pipes, and a child left running would park their
-                    // joins below — codex kills on a wait error for the same
-                    // reason.
+                    // Reap before bailing: a child left running would keep
+                    // its pipes open past the drain below — codex kills on a
+                    // wait error for the same reason.
                     subprocess::kill_process_group(&mut child);
                     run.error = Some(format!("failed to wait: {err}"));
                     break None;
@@ -890,12 +911,28 @@ impl CommandHooks {
             std::thread::sleep(POLL_INTERVAL);
         };
 
-        // The group kill above has reaped anything holding the pipes, so the
-        // joins terminate — the writer's pipe end is closed by the child's
-        // death too, so it can never outlive this point.
-        run.stdout = out_reader.join().unwrap_or_default();
-        run.stderr = err_reader.join().unwrap_or_default();
-        let write_error = stdin_writer.and_then(|writer| writer.join().unwrap_or_default());
+        // The hook is over when its own process is. The pipes normally close
+        // with it — or with the group kill above — but a process it left
+        // running holds them as long as it lives (`server &` without a
+        // redirect, or one that left the group): what it had printed is what
+        // was read within a short grace, and the readers are left to drain
+        // the rest into nothing. Waiting for EOF instead held every later
+        // hook on the lane behind that process (`docs/hooks.md`).
+        let drained_by = Instant::now() + PIPE_DRAIN_GRACE;
+        run.stdout = out_reader.finish(drained_by, cancel);
+        run.stderr = err_reader.finish(drained_by, cancel);
+        // The writer ends when the child's stdin closes — the same holders
+        // can keep a big payload's write parked, so it gets the same grace.
+        let write_error = stdin_writer.and_then(|writer| {
+            while !writer.is_finished() && Instant::now() < drained_by && !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if writer.is_finished() {
+                writer.join().unwrap_or_default()
+            } else {
+                None
+            }
+        });
         if run.error.is_none() {
             run.error = write_error;
         }
@@ -1020,13 +1057,18 @@ impl CommandHooks {
     /// `SessionEnd` at a **quit**: the lane's queued work is dropped and its
     /// running job reaped (a slow `SessionStart` must not eat the budget),
     /// then the event runs and the caller waits for it — bounded, so a quit
-    /// never hangs on a hook. `true` when it finished inside the budget.
-    pub fn end_session_at_exit(&self, reason: &str) -> bool {
+    /// never hangs on a hook. A quit that cut a turn short (`interrupted`)
+    /// fires that turn's `Interrupt` first, codex's order on a shutdown, and
+    /// waits for both. `true` when they finished inside the budget.
+    pub fn end_session_at_exit(&self, reason: &str, interrupted: bool) -> bool {
         self.handles.lane.cancel_pending();
+        let mut budget = BOUNDED_EVENT_BUDGET + Duration::from_millis(500);
+        if interrupted {
+            self.fire_interrupt();
+            budget += BOUNDED_EVENT_BUDGET;
+        }
         self.fire_session_end(reason);
-        self.handles
-            .lane
-            .wait_idle_for(BOUNDED_EVENT_BUDGET + Duration::from_millis(500))
+        self.handles.lane.wait_idle_for(budget)
     }
 
     /// Run an event's handlers under the **whole-event** budget
@@ -1035,10 +1077,13 @@ impl CommandHooks {
     /// `Interrupt`: an Esc). Output is ignored; past cancellation, so the
     /// budget is the only stop.
     fn run_bounded(&self, event: HookEvent, query: Option<&str>, payload: &str) {
-        let selection = self.file.select(event, query);
+        let mut handlers = self.file.select(event, query).handlers;
+        // Neither event can be refused, so the integration layer always
+        // hears it — after everything else, as for every event.
+        handlers.sort_by_key(|handler| handler.observer);
         let started = Instant::now();
         let cancel = CancelToken::new();
-        for handler in &selection.handlers {
+        for handler in &handlers {
             let remaining = BOUNDED_EVENT_BUDGET.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;
@@ -1063,29 +1108,88 @@ impl CommandHooks {
     }
 }
 
-/// Read a pipe to a lossy `String`, **capped in memory as it is read**
-/// (`tui::shell::append_capped`'s rule — a hook that spews gigabytes must not
-/// spike RSS): the first [`HOOK_OUTPUT_MAX_BYTES`] are kept, the rest is
-/// drained and dropped so the child never blocks on a full pipe, and
-/// [`truncate_output`] stamps the marker. An absent pipe reads as empty.
-fn read_pipe<R: Read>(pipe: Option<R>) -> String {
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    // One byte past the cap, so `truncate_output` can tell "exactly full"
-    // from "overflowed" and only mark the latter.
-    let mut kept: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match pipe.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let room = (HOOK_OUTPUT_MAX_BYTES + 1).saturating_sub(kept.len());
-                kept.extend_from_slice(&chunk[..n.min(room)]);
+/// One of a handler's output pipes, read on a thread of its own into a
+/// buffer **capped in memory as it is read** (`tui::shell::append_capped`'s
+/// rule — a hook that spews gigabytes must not spike RSS): the first
+/// [`HOOK_OUTPUT_MAX_BYTES`] are kept, the rest drained and dropped so the
+/// writer never blocks on a full pipe. Shared rather than handed back at the
+/// end, so the runner can stop waiting for an end that a process the hook
+/// left running may never let come ([`finish`](Self::finish)).
+struct PipeCapture {
+    shared: Arc<(std::sync::Mutex<PipeRead>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct PipeRead {
+    kept: Vec<u8>,
+    /// The pipe reached its end (or was never there).
+    closed: bool,
+}
+
+impl PipeCapture {
+    fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let shared = Arc::new((
+            std::sync::Mutex::new(PipeRead::default()),
+            std::sync::Condvar::new(),
+        ));
+        let reader = Arc::clone(&shared);
+        let close = move |reader: &(std::sync::Mutex<PipeRead>, std::sync::Condvar)| {
+            reader
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed = true;
+            reader.1.notify_all();
+        };
+        match pipe {
+            None => close(&reader),
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut read = reader
+                                    .0
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                // One byte past the cap, so `truncate_output`
+                                // can tell "exactly full" from "overflowed"
+                                // and only mark the latter.
+                                let room =
+                                    (HOOK_OUTPUT_MAX_BYTES + 1).saturating_sub(read.kept.len());
+                                read.kept.extend_from_slice(&chunk[..n.min(room)]);
+                            }
+                        }
+                    }
+                    close(&reader);
+                });
             }
         }
+        Self { shared }
     }
-    truncate_output(&String::from_utf8_lossy(&kept))
+
+    /// What was read once the pipe closed — or by `until`, or by a cancel,
+    /// whichever comes first — as a lossy `String` [`truncate_output`] has
+    /// marked. A reader still running then is left to drain the rest.
+    fn finish(&self, until: Instant, cancel: &CancelToken) -> String {
+        let (read, closed) = &*self.shared;
+        let mut read = read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !read.closed && !cancel.is_cancelled() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            read = closed
+                .wait_timeout(read, left.min(POLL_INTERVAL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        truncate_output(&String::from_utf8_lossy(&read.kept))
+    }
 }
 
 /// The cell/model text pair for a hook refusal — the same two-text shape the
@@ -1690,6 +1794,32 @@ mod tests {
     }
 
     #[test]
+    fn a_process_a_hook_leaves_holding_its_output_never_holds_the_event_up() {
+        // `server &` with no redirect: the hook is done when its own process
+        // is, though what it started still holds the pipes — and on the
+        // hooks' lane, an event that waited for that would hold up every
+        // hook after it.
+        let hooks = hooks_for(
+            r#"{"hooks":{"SessionStart":[{"hooks":[
+                {"type":"command","command":"sleep 6 & echo started"}]}]}}"#,
+        );
+        hooks
+            .handles
+            .sources
+            .lock()
+            .unwrap()
+            .push("startup".to_string());
+        let started = Instant::now();
+        let contexts = hooks.session_start(&CancelToken::new());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "waited on the background process: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(contexts, ["started"], "what it printed still counts");
+    }
+
+    #[test]
     fn a_missing_hook_command_fails_open_with_a_warning() {
         let hooks = hooks_for(&pre_hook("/definitely/not/a/real/binary"));
         let verdict = hooks.pre_tool_use(&call("bash", "{}"), &CancelToken::new());
@@ -2167,6 +2297,98 @@ mod tests {
             .collect()
     }
 
+    /// A sink over the user's `user` file with `integration` as the
+    /// observing `hooks.d` layer behind it — what a session with an
+    /// integration installed runs (`docs/herdr.md`).
+    fn layered_hooks(user: &str, integration: &str) -> CommandHooks {
+        let user = HooksFile::parse(user).expect("user fixture parses");
+        let integration = HooksFile::parse(integration)
+            .expect("integration fixture parses")
+            .observing();
+        CommandHooks::new(
+            Arc::new(user.merged(&integration)),
+            HookContext {
+                session_id: "s".into(),
+                cwd: "/tmp".into(),
+                ..HookContext::default()
+            },
+            None,
+            std::env::temp_dir(),
+            HookHandles::default(),
+        )
+        .expect("the fixture has a runnable handler")
+    }
+
+    #[test]
+    fn an_integration_never_hears_of_an_event_another_hook_vetoed() {
+        let probe = std::env::temp_dir().join("alter-zero-hook-vetoed-integration-probe.jsonl");
+        let _ = std::fs::remove_file(&probe);
+        let record = format!("cat >> {p}; echo >> {p}", p = probe.display());
+        let integration = format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"hooks":[{{"type":"command","command":"{record}"}}]}}],
+                 "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{record}"}}]}}],
+                 "Stop":[{{"hooks":[{{"type":"command","command":"{record}"}}]}}]}}}}"#
+        );
+        let refuse = r#"{"type":"command","command":"echo refused >&2; exit 2"}"#;
+        let user = format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"hooks":[{refuse}]}}],
+                 "UserPromptSubmit":[{{"hooks":[{refuse}]}}],
+                 "Stop":[{{"hooks":[{refuse}]}}]}}}}"#
+        );
+        let hooks = layered_hooks(&user, &integration);
+        let cancel = CancelToken::new();
+        // A refused call, a refused prompt, a stop turned into a
+        // continuation: none of them happened, so the integration — which
+        // reports what the session does — is never told they did.
+        assert!(
+            hooks
+                .pre_tool_use(&call("askuserquestion", "{}"), &cancel)
+                .blocked
+                .is_some()
+        );
+        assert!(hooks.user_prompt_submit("hi", &cancel).blocked.is_some());
+        assert!(hooks.stop(false, "done", &cancel).is_some());
+        assert_eq!(recorded(&probe), Vec::<serde_json::Value>::new());
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    #[test]
+    fn an_integration_runs_after_the_other_hooks_of_an_event_that_went_ahead() {
+        let order = std::env::temp_dir().join("alter-zero-hook-integration-order-probe.txt");
+        let _ = std::fs::remove_file(&order);
+        let mark = |who: &str| {
+            format!(
+                r#"{{"type":"command","command":"cat > /dev/null; echo {who} >> {o}"}}"#,
+                o = order.display()
+            )
+        };
+        // The user's Stop hook asks for another round but `continue: false`
+        // outranks it — the turn really ends, so the integration hears it.
+        let ends = r#"{"type":"command","command":"printf '%s' '{\"decision\":\"block\",\"reason\":\"r\",\"continue\":false}'"}"#;
+        let user = format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"hooks":[{}]}}],"Stop":[{{"hooks":[{ends}]}}]}}}}"#,
+            mark("user")
+        );
+        let integration = format!(
+            r#"{{"hooks":{{"PreToolUse":[{{"hooks":[{i}]}}],"Stop":[{{"hooks":[{i}]}}]}}}}"#,
+            i = mark("integration")
+        );
+        let hooks = layered_hooks(&user, &integration);
+        let cancel = CancelToken::new();
+        assert!(
+            hooks
+                .pre_tool_use(&call("bash", "{}"), &cancel)
+                .blocked
+                .is_none()
+        );
+        assert_eq!(hooks.stop(false, "done", &cancel), None);
+        assert_eq!(
+            std::fs::read_to_string(&order).unwrap_or_default(),
+            "user\nintegration\nintegration\n"
+        );
+        let _ = std::fs::remove_file(&order);
+    }
+
     #[test]
     fn a_failed_call_runs_post_tool_use_failure_and_its_context_reaches_the_model() {
         let json = r#"{"hooks":{"PostToolUseFailure":[{"matcher":"askuserquestion","hooks":[
@@ -2613,7 +2835,7 @@ mod tests {
         }
         assert!(started.exists(), "the turn's hook never started");
         turn.cancel();
-        assert!(hooks.end_session_at_exit("prompt_input_exit"));
+        assert!(hooks.end_session_at_exit("prompt_input_exit", false));
         backend.join().unwrap();
         let lines: Vec<String> = std::fs::read_to_string(&probe)
             .unwrap_or_default()
@@ -2734,6 +2956,36 @@ mod tests {
     }
 
     #[test]
+    fn a_quit_that_cut_a_turn_short_ends_the_turn_before_the_session() {
+        // codex's order on a shutdown: the interrupted turn's `Interrupt`,
+        // then `SessionEnd` — a hook that heard the turn start hears it end.
+        let probe = std::env::temp_dir().join("alter-zero-hook-quit-interrupt-probe.jsonl");
+        let _ = std::fs::remove_file(&probe);
+        let hooks = recording_hooks(&probe, &[("Interrupt", None), ("SessionEnd", None)]);
+        assert!(hooks.end_session_at_exit("prompt_input_exit", true));
+        let events: Vec<serde_json::Value> = recorded(&probe)
+            .iter()
+            .map(|sent| sent["hook_event_name"].clone())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                serde_json::json!("Interrupt"),
+                serde_json::json!("SessionEnd")
+            ]
+        );
+        // A quit at rest interrupts nothing.
+        let _ = std::fs::remove_file(&probe);
+        assert!(hooks.end_session_at_exit("prompt_input_exit", false));
+        let events: Vec<serde_json::Value> = recorded(&probe)
+            .iter()
+            .map(|sent| sent["hook_event_name"].clone())
+            .collect();
+        assert_eq!(events, [serde_json::json!("SessionEnd")]);
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    #[test]
     fn quitting_runs_session_end_even_behind_a_slow_session_start() {
         let probe = std::env::temp_dir().join("alter-zero-hook-exit-probe.jsonl");
         let _ = std::fs::remove_file(&probe);
@@ -2752,7 +3004,7 @@ mod tests {
         hooks.fire_session_start();
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
-        assert!(hooks.end_session_at_exit("prompt_input_exit"));
+        assert!(hooks.end_session_at_exit("prompt_input_exit", false));
         assert!(
             started.elapsed() < Duration::from_secs(4),
             "the slow SessionStart was reaped: {:?}",

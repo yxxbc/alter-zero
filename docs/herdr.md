@@ -66,21 +66,28 @@ slow the agent down):
   (`max(now, last + 1)`, the last one stored beside the state below). herdr
   drops a report whose `seq` is not higher than the last it accepted, from
   this source, across restarts — which is what makes a late report harmless.
-- `agent_session_id` and `resume_argv` ride **only once the conversation
-  has a rollout file** (the payload's `transcript_path` is not null). A
-  fresh session has none until its first message is recorded
+- `resume_argv` rides **every** report: `alter-zero --resume <id>` (beside
+  `agent_session_id`) once the conversation has a rollout file — the
+  payload's `transcript_path` is not null — and a bare `alter-zero` before
+  that. A fresh session has no file until its first message is recorded
   (`docs/resume.md`, deferred create), and a resume command naming an id
-  with no file behind it would fail on restore. `resume_argv` is what herdr
-  acts on: it runs it in the pane's directory after a server restart, and
-  its rules are that the first word is a plain command on `PATH` (the
-  binary's own file name, not its path), no argument holds an apostrophe or
-  a control character, at most 64 arguments and 8 KiB — a report breaking
-  them is refused whole, so the reporter drops the pair rather than send
-  one. `agent_session_id` names the conversation for herdr's records (herdr
-  reads it only for the agents it ships support for; for a vendor source
-  it is informational). `--resume` restores the conversation's own model
-  (`docs/session-model.md`) and the directory's permission mode is per
-  project already, so `alter-zero --resume <id>` is the whole command.
+  with no file behind it would fail on restore; but leaving the command
+  off is worse than a fresh start, because herdr keeps the last one it was
+  given — after a `/clear`, the conversation the user just left. The turn
+  writes its rollout before its first hook runs, so even its first
+  `working` carries the `--resume`. `resume_argv` is what herdr acts on: it
+  runs it in the pane's directory after a server restart, and its rules are
+  that the first word is a plain command on `PATH` (the binary's own file
+  name, not its path), no argument holds an apostrophe or a control
+  character, at most 64 arguments and 8 KiB — a report breaking them is
+  refused whole, so the reporter falls back to the fresh start for an id
+  herdr would refuse, and drops the command only when the binary's own
+  name is one. `agent_session_id` names the conversation for herdr's
+  records (herdr reads it only for the agents it ships support for; for a
+  vendor source it is informational). `--resume` restores the
+  conversation's own model (`docs/session-model.md`) and the directory's
+  permission mode is per project already, so `alter-zero --resume <id>` is
+  the whole command.
 - `pane.release_agent` is sent once, when the session really ends — a quit
   (`SessionEnd` with `prompt_input_exit` or `other`). A `/clear` or a
   `/resume` replaces the conversation in the same process, which herdr asks
@@ -90,8 +97,8 @@ slow the agent down):
 
 The reporter keeps two facts across events, because each event is a
 separate process: whether the **lead's turn** is running, and the set of
-**prompts waiting on the user** (by tool call id). What it reports is
-derived from them every time:
+**prompts waiting on the user** (by agent and tool call id). What it
+reports is derived from them every time:
 
 ```
 blocked   if any prompt is waiting
@@ -105,9 +112,10 @@ idle      otherwise
 | `UserPromptSubmit` | — | the turn is running |
 | `PreToolUse` | — | the lead's call → the turn is running (a background follow-up turn, which has no prompt of its own, starts here); an `askuserquestion` call (lead or subagent) → its question is waiting |
 | `PostToolUse`, `PostToolUseFailure` | `askuserquestion` | the question was answered, declined or timed out |
+| `PostToolUse` | `agentkill` | the lead stopped an agent: its prompts left the screen with it |
 | `Notification` | `permission_prompt` | a permission prompt is on screen → waiting |
 | `PermissionResult` | — | that prompt was answered → no longer waiting |
-| `Stop`, `StopFailure` | — | the lead's turn ended (naturally / on an error) |
+| `Stop`, `StopFailure` | — | the lead's turn ended (naturally / on an error), and anything of the lead's still waiting with it |
 | `Interrupt` | — | the user interrupted the turn: it ended, and every prompt it raised went with it |
 | `PreCompact`, `PostCompact` | — | a `/compact` summarization started / landed |
 | `SessionEnd` | — | `prompt_input_exit` / `other` → release the pane; `clear` / `resume` → nothing (the next `SessionStart` reports) |
@@ -123,13 +131,26 @@ Three rules hold the table together:
 - **Prompts are a set, not a flag.** Parallel agents ask before any one is
   answered (`docs/permissions.md`): two prompts can be waiting at once, and
   answering the first must leave the pane `blocked` while the second is on
-  screen. Keyed by call id, a prompt is added and removed exactly once, so
-  the order two agents' hooks reach the reporter in does not matter.
+  screen. Keyed by agent **and** call id — a call id is unique only within
+  one conversation, and Ollama numbers every round's calls from `call_0`,
+  so the lead's prompt and a subagent's can share one — a prompt is added
+  and removed exactly once, and the order two agents' hooks reach the
+  reporter in does not matter. A prompt can also leave without an answer:
+  the lead's turn ending takes whatever of the lead's was left, and the
+  lead's `agentkill` takes the stopped agent's, which leaves the screen
+  with it (`docs/permissions.md`).
 - **The turn's end clears the turn.** `Stop`, `StopFailure` and `Interrupt`
   are the three ways a lead turn ends, and the reporter needs all three — the
   last two are exactly what codex's integration was missing before codex
   added `Interrupt` (openai/codex#22858: Esc fired nothing, so external
-  status integrations stayed at *Running*).
+  status integrations stayed at *Running*). A `/clear` or a quit that cuts
+  a turn short fires its `Interrupt` too, before the `SessionEnd`.
+- **Only what happened is reported.** The integration's hooks run after
+  the user's and the project's, and not for an event those vetoed
+  (`docs/hooks.md` *Integrations*): a prompt a `UserPromptSubmit` hook
+  refused never makes the pane *working*, a question a `PreToolUse` hook
+  refused never makes it *blocked*, and a `Stop` a hook turned into another
+  round never makes it *idle* while that round runs.
 
 The state lives in one small JSON file per pane —
 `~/.alter-zero/herdr/{hash of socket path + pane id}.json` (the config
@@ -146,7 +167,7 @@ enough to drive herdr. Auditing it against herdr's own integrations — codex
 (`SessionStart`, `UserPromptSubmit`, `Stop`, `Interrupt`), and the two that
 report full lifecycle state through hooks alone, Kimi Code
 (`PermissionRequest`/`PermissionResult`, `PostToolUseFailure`, `Interrupt`)
-and MastraCode — found six things, each fixed in the engine rather than
+and MastraCode — found seven things, each fixed in the engine rather than
 worked around in the reporter (`docs/hooks.md` has the details):
 
 1. **`session_id` was not the conversation's.** Payloads carried an id
@@ -191,13 +212,22 @@ worked around in the reporter (`docs/hooks.md` has the details):
    rides the lane itself, under the turn's own token: an Esc on that prompt
    fires an `Interrupt` that queues behind it, so herdr can never hear
    *idle* and then a late *blocked* — while the Esc still reaps a reporter
-   that hangs.
+   that hangs. A quit cancels every subagent before its `SessionEnd`, so a
+   background agent's tool call can never report after the release and
+   put the pane's agent back for a session that is gone.
 6. **Hooks were off in every directory you had not opted into.** The
    `/settings` **Hooks** row is per directory and off by default
    (`docs/per-directory-state.md`) — right for `~/.alter-zero/hooks.json`,
    which holds the user's own guards and formatters, and wrong for an
    integration with the terminal, which belongs to every directory. So
    integrations live in their own always-on layer, `~/.alter-zero/hooks.d/`.
+7. **An integration heard what another hook refused.** Handlers run in
+   order and all of them run, so the reporter was told of a prompt a
+   `UserPromptSubmit` hook had refused (the pane stuck *working* with no
+   turn running), of a question a `PreToolUse` hook had refused (stuck
+   *blocked*), and of a `Stop` a hook had turned into another round (*idle*
+   while that round ran). The integration layer now observes: it runs
+   after everything else and not for an event that was stopped.
 
 Codex, by comparison, sees `blocked` by reading the screen (herdr's codex
 manifest), runs `SessionStart` lazily, and leaves `working` standing after a
@@ -270,35 +300,38 @@ pane, a pane's agent terminal, or neither.
 
 ## Known gaps
 
-- **A prompt blocked by another `UserPromptSubmit` hook** leaves the pane
-  `working`: the herdr hook ran and reported the turn, the block came from a
-  sibling handler, and no event follows a refused prompt (neither reference
-  fires one either). The next turn corrects it.
 - **The offline demo fires no hooks** (`docs/hooks.md`), so neither does this:
   a session with no provider configured is invisible to herdr until
   `/login`.
 - **A herdr that accepts and never answers slows the hooks.** A socket
-  with nothing listening fails at once; one whose server has wedged costs
-  each report its 500 ms timeouts, and the hooks run one after another, so
-  each later hook waits that long too. Nothing the user sees waits on it —
-  the prompt is on screen before its `Notification` runs — and the hook's
-  10 s timeout bounds the worst case.
+  with nothing listening fails at once, and herdr accepts on a thread of
+  its own, so the connect never waits; but a server whose request handling
+  has wedged costs each report its 500 ms read timeout — herdr's own
+  integrations allow the same 0.5 s — and the hooks run one after another,
+  so each later hook waits that long too. Nothing the user sees waits on
+  it — the prompt is on screen before its `Notification` runs — and the
+  hook's 10 s timeout bounds the worst case.
 
 ## Testing
 
 - The state machine, the request lines and the installed file are pure and
   unit-tested (`src/herdr.rs`): every row of the table, the prompt set under
-  reordering, the subagent rule, `seq` monotonicity, the resume argv's
-  validation, the release.
+  reordering, a call id the lead and two agents share, the lead's turn end
+  and `agentkill` taking prompts with them, the subagent rule, `seq`
+  monotonicity, the resume argv's validation and its fresh-start fallback,
+  the release.
 - The engine's new events have real-`sh` runner tests and `run_agent` /
   `approve_call` wiring tests beside the existing ones (`docs/hooks.md`).
 - `tests/herdr_reporter.rs` runs the real binary's `integration hook herdr`
   against a stub Unix socket: payloads in, the exact requests out, the
-  state file across invocations.
+  state file across invocations (a shared call id included).
 - `scripts/smoke.sh` Phase 132 drives the whole loop: a stub
   chat-completions provider, a stub herdr socket, `integration install` into
   the phase's config home, and a session launched with herdr's variables —
   `idle` at launch, `working` then `idle` around a turn with the resume
   command attached (its id the one the quit hint prints), `blocked` while a
   permission prompt is open, `idle` after Esc, the release on quit, and the
-  resume command herdr was given bringing the conversation back.
+  resume command herdr was given bringing the conversation back — then a
+  second session beside a user hooks file: a refused prompt never
+  reported, a Stop hook's extra round still *working*, and a `/clear` and a
+  quit mid-turn each ending the turn (`Interrupt`) before the session.

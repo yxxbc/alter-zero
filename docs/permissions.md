@@ -761,6 +761,16 @@ Subagent calls take the same seam — `spawn_subagent_run` passes the agent's ty
 as the request's `agent`, and the event rides the agent channel's forwarder, so
 `on_agent_event` opens the same prompt.
 
+**A stopped agent takes its prompts with it.** The lead's `agentkill` or the
+roster's `x` cancels the agent, whose thread then gives up its `wait` — but the
+prompt it raised used to stay on screen, asking about a call that could never
+run, and answering it resolved nothing. `App::withdraw_agent_permissions` now
+runs with both stops: the agent's queued requests drop, its open prompt closes
+and the next queued modal opens in its place, and their ids are released like
+any abandoned request. A prompt withdrawn this way gets no `PermissionResult`
+hook — the lead's `agentkill` call is the record (`docs/hooks.md`,
+`docs/herdr.md`).
+
 ## What the amend feedback is worth
 
 Tab's whole point is saying *what to do instead*, so that sentence has to

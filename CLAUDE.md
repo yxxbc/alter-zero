@@ -1821,7 +1821,8 @@ when fired, so an Esc's `Interrupt` reaches a hook after the `Notification`
 of the prompt it closed and before the next turn's `UserPromptSubmit`; and
 after every hook of the turn it ended, since `Interrupt`/`SessionEnd` wait
 until no running dispatch belongs to a cancelled turn — `InFlight` — and a
-quit cancels a running turn before its `SessionEnd`):
+quit cancels a running turn **and every subagent** before its `SessionEnd`,
+so no hook lands after it):
 the tool-path gate/annotate/rewrite calls (**`agent` launches
 included** — `Task` aliases to `agent`, and each tool name answers to its
 Claude Code spelling as a second exact name; `PostToolUse` fires only for a
@@ -1842,12 +1843,16 @@ refuse the prompt — `StreamEvent::PromptBlocked`, the submission rolled back
 out of history *and* the rollout (the recorder's shrink-rewrite), the text
 returned to the composer under a red reason-only notice — or inject context,
 a loop-initiated background follow-up turn being marked synthetic and
-skipped; `PreCompact`/`PostCompact` ride the summarization spawn via the
+skipped (the mark cleared before every user turn, so one nobody consumed
+cannot silence a real prompt's event; the turn's rollout written before its
+thread starts, so even its first event names the transcript);
+`PreCompact`/`PostCompact` ride the summarization spawn via the
 `CompactHooks` wrapper (PreCompact stdout/context = extra compact
 instructions, **no block — neither reference honours one**),
 `SessionEnd` (`clear`/`resume`/`prompt_input_exit`) and `Interrupt` (an Esc
-that stops an agent turn — codex's event; without it Esc fired nothing) run
-under a 2 s whole-event budget, `StopFailure` fires on a failed round with
+that stops an agent turn — codex's event; without it Esc fired nothing —
+and a `/clear` or quit that cuts one short, ahead of its `SessionEnd`,
+codex's shutdown order) run under a 2 s whole-event budget, `StopFailure` fires on a failed round with
 the error type as its matcher before the `Error` event leaves, and
 `Notification` (`permission_prompt`) as a prompt opens with
 `PermissionResult` (`decision: {behavior, source}`) once a request is
@@ -1877,8 +1882,14 @@ which keeps the session's first id). Three layers, union-merged: the user's
 file, the trusted project file (`docs/project-config.md`), and the
 **integrations** in `{config_home}/hooks.d/*.json`, which run whatever the
 Hooks row says (a hook connecting Alter Zero to the terminal belongs to
-every directory) and only `ALTER_ZERO_HOOKS=0` silences; every hook child
-gets `ALTER_ZERO_BIN_PATH`, the running binary; a malformed file is a red
+every directory) and only `ALTER_ZERO_HOOKS=0` silences — and which
+**observe**: they run after every other handler, and not for an event
+those vetoed (`HooksFile::observing`, `HookOutcome::prevents` — a refused
+call or prompt, a Stop turned into another round), since an integration
+reports what happened; every hook child
+gets `ALTER_ZERO_BIN_PATH`, the running binary; a hook is over when its
+process is (a process it left holding its pipes no longer stalls every
+hook behind it on the lane — `PIPE_DRAIN_GRACE`); a malformed file is a red
 startup toast, not a silent "no hooks". `/settings` gains a **Hooks** row,
 unavailable when no file resolved and **off until a directory turns it on**
 (`docs/per-directory-state.md`); `ALTER_ZERO_HOOKS` seeds it for a run and
@@ -1910,11 +1921,14 @@ line that exits unless `HERDR_ENV=1` and otherwise `exec`s
 the payload, takes the pane's state file
 (`{config_home}/herdr/{fnv(socket, pane)}.json`) under `File::lock`, steps
 the pure `herdr::step` state machine — the lead's turn as a flag, the
-prompts waiting on the user as a **set** of call ids, since parallel
-agents ask at once, `blocked` > `working` > `idle`, a subagent never moving
+prompts waiting on the user as a **set** keyed by agent **and** call id
+(parallel agents ask at once, and Ollama's per-round `call_0` repeats
+across agents), cleared of the lead's at its turn's end and of an agent's
+at the lead's `agentkill`, `blocked` > `working` > `idle`, a subagent never moving
 the turn — and sends `pane.report_agent` (with `agent_session_id` and a
 validated `resume_argv` = `alter-zero --resume {id}` once the conversation
-has a rollout) or, at a real quit, `pane.release_agent` over the Unix
+has a rollout, a bare `alter-zero` before — never a stale `--resume` herdr
+kept from a `/clear`ed conversation) or, at a real quit, `pane.release_agent` over the Unix
 socket, `seq` a strictly rising nanosecond stamp; it prints nothing and
 always exits `0`, since a hook's stdout is model context and exit 2 a
 block. A terminal the agent's own tools run carries `ALTER_ZERO_AGENT=1`

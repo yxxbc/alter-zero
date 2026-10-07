@@ -854,12 +854,13 @@ impl ModelSession {
         self.fire_session_start();
     }
 
-    /// The session is quitting: `SessionEnd` (`prompt_input_exit`), waited
-    /// for under its bounded budget — whatever the lane still held is
-    /// dropped first, so a quit never hangs on a hook (`docs/hooks.md`).
-    pub(crate) fn end_session_at_exit(&self) {
+    /// The session is quitting: `SessionEnd` (`prompt_input_exit`) — after
+    /// an `Interrupt` when the quit cut a turn short — waited for under the
+    /// events' bounded budget, whatever the lane still held dropped first, so
+    /// a quit never hangs on a hook (`docs/hooks.md`).
+    pub(crate) fn end_session_at_exit(&self, interrupted: bool) {
         if let Some(hooks) = self.boundary_hooks() {
-            hooks.end_session_at_exit("prompt_input_exit");
+            hooks.end_session_at_exit("prompt_input_exit", interrupted);
         }
     }
 
@@ -879,11 +880,24 @@ impl ModelSession {
     /// completion's follow-up): its prompt is synthesized, so the
     /// `UserPromptSubmit` hook must not fire for it (`docs/hooks.md`).
     pub(crate) fn mark_synthetic_turn(&self) {
+        self.set_synthetic_turn(true);
+    }
+
+    /// Drop a synthetic-turn mark nobody consumed — called before every
+    /// **user** turn. Only a sink running the turn's hooks consumes the mark,
+    /// so one set while hooks were off (or on the offline demo, which runs
+    /// none) used to outlive its turn and silence the user's next real
+    /// prompt's `UserPromptSubmit` (`docs/hooks.md`).
+    pub(crate) fn clear_synthetic_turn(&self) {
+        self.set_synthetic_turn(false);
+    }
+
+    fn set_synthetic_turn(&self, synthetic: bool) {
         if let Some(setup) = &self.hooks {
             setup
                 .handles
                 .synthetic_turn
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+                .store(synthetic, std::sync::atomic::Ordering::SeqCst);
         }
     }
 

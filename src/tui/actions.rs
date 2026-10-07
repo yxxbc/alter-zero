@@ -448,7 +448,14 @@ impl Session<'_> {
         // any stale chunk or ToolStart the dying thread still emits lands on the
         // dropped receiver, so it can't repopulate the cleared state. See
         // docs/interrupt.md.
+        let interrupted = self.hooked_turn_in_flight();
         self.abandon_inflight();
+        // A turn the `/clear` cut short ends for the hooks the way an Esc
+        // ends one — `Interrupt`, queued ahead of the SessionEnd below, so
+        // the turn a hook heard start always hears its end (docs/hooks.md).
+        if interrupted {
+            self.models.fire_interrupt();
+        }
         self.render.reset();
         // …and the pictures the wiped conversation kept encoded for the wire
         // (`docs/memory.md`): nothing re-sends them now.

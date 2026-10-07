@@ -48,6 +48,11 @@ pub struct MatcherGroup {
     pub matcher: Option<String>,
     #[serde(default)]
     pub hooks: Vec<HookHandler>,
+    /// The group belongs to the integration layer, which **observes**
+    /// ([`HooksFile::observing`]). Set by the loader, never read from the
+    /// file — a `hooks.json` cannot move its own handlers out of the way.
+    #[serde(skip)]
+    pub observer: bool,
 }
 
 /// One handler inside a group.
@@ -118,6 +123,9 @@ pub struct CommandHook {
     /// default of its own to drift from this one.
     pub timeout_secs: u64,
     pub status_message: Option<String>,
+    /// From the integration layer: runs after every other handler of the
+    /// event, and only when those let it happen ([`HooksFile::observing`]).
+    pub observer: bool,
 }
 
 impl CommandHook {
@@ -174,6 +182,20 @@ impl HooksFile {
         out
     }
 
+    /// This file as the **integration layer** (`hooks.d`, `docs/herdr.md`):
+    /// every handler observes — the runner runs it after the event's other
+    /// handlers, and skips it when they stopped the event from happening
+    /// ([`super::HookOutcome::prevents`]). An integration reports what the
+    /// session does; a refused call, a refused prompt or a stop turned into
+    /// a continuation is something it did not do.
+    #[must_use]
+    pub fn observing(mut self) -> Self {
+        for group in self.hooks.values_mut().flatten() {
+            group.observer = true;
+        }
+        self
+    }
+
     /// Is there nothing here to run? Used to report the `/settings` row as
     /// unavailable rather than advertising a toggle that does nothing.
     #[must_use]
@@ -224,7 +246,8 @@ impl HooksFile {
             }
             for handler in &group.hooks {
                 match handler.resolve() {
-                    Ok(hook) => {
+                    Ok(mut hook) => {
+                        hook.observer = group.observer;
                         // `"async": true` parses so a config shared with
                         // another tool loads, but every v1 hook is
                         // synchronous. Running it inline is the safe reading
@@ -282,6 +305,7 @@ impl HookHandler {
                 .filter(|t| *t > 0)
                 .unwrap_or(CommandHook::DEFAULT_TIMEOUT_SECS),
             status_message: self.status_message.clone(),
+            observer: false,
         })
     }
 }
@@ -321,6 +345,7 @@ mod tests {
                 command: "./guard.sh".to_string(),
                 timeout_secs: 10,
                 status_message: Some("checking…".to_string()),
+                observer: false,
             }]
         );
     }
@@ -644,6 +669,7 @@ mod tests {
                 command: "./guard.sh".to_string(),
                 timeout_secs: 10,
                 status_message: Some("checking…".to_string()),
+                observer: false,
             }]
         );
     }
@@ -658,6 +684,38 @@ mod tests {
             HooksFile::default().merged(&project).description.as_deref(),
             Some("project guards")
         );
+    }
+
+    #[test]
+    fn an_observing_layers_handlers_are_marked_and_selected_after_the_rest() {
+        let integration = parse(
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"./report.sh"}]}]}}"#,
+        )
+        .observing();
+        let marked: Vec<(String, bool)> = parse(SAMPLE)
+            .merged(&integration)
+            .select(HookEvent::PreToolUse, Some("bash"))
+            .handlers
+            .into_iter()
+            .map(|h| (h.command, h.observer))
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                ("./guard.sh".to_string(), false),
+                ("./report.sh".to_string(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hooks_file_cannot_mark_its_own_handlers_as_observers() {
+        // Only the loader decides which layer observes (`docs/herdr.md`): a
+        // key in the file is ignored like any other unknown one.
+        let file = parse(
+            r#"{"hooks":{"Stop":[{"observer":true,"hooks":[{"type":"command","command":"./x.sh"}]}]}}"#,
+        );
+        assert!(!file.select(HookEvent::Stop, None).handlers[0].observer);
     }
 
     #[test]

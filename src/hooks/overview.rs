@@ -308,8 +308,8 @@ pub const fn event_description(event: HookEvent) -> &'static str {
              Observation only - output and exit codes are ignored"
         }
         HookEvent::Interrupt => {
-            "Runs when the user interrupts a running turn (Esc); Stop does not \
-             fire for it.\n\
+            "Runs when the user interrupts a running turn (Esc), or a /clear or a \
+             quit cuts one short; Stop does not fire for it.\n\
              Observation only, under a 2s budget - output and exit codes are ignored"
         }
         HookEvent::SubagentStart => {
@@ -554,6 +554,10 @@ mod tests {
             "{}",
             event_description(HookEvent::SessionEnd)
         );
+        // A `/clear` or a quit that cuts a turn short interrupts it too.
+        let interrupt = event_description(HookEvent::Interrupt);
+        assert!(interrupt.contains("/clear"), "{interrupt}");
+        assert!(interrupt.contains("quit"), "{interrupt}");
         // The tool-call limit ends a turn on an error too.
         let failure = event_description(HookEvent::StopFailure);
         assert!(failure.contains("tool-call limit"), "{failure}");

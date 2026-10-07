@@ -32,7 +32,11 @@ pub const NESTED_VAR: &str = "ALTER_ZERO_AGENT";
 
 /// The question tool: its call puts a question on screen, so it is a prompt
 /// the user must answer, like a permission prompt.
-const ASK_TOOL: &str = "askuserquestion";
+const ASK_TOOL: &str = crate::llm::tools::ASK_TOOL_NAME;
+
+/// The lead's way of stopping an agent: whatever that agent had on screen
+/// goes with it, and nothing else will ever answer it.
+const KILL_TOOL: &str = crate::llm::tools::AGENT_KILL_TOOL;
 
 /// The command every installed hook runs: `sh` checks it is inside herdr
 /// before the reporter is even started, so a session outside herdr pays one
@@ -50,7 +54,7 @@ pub const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", None),
     ("UserPromptSubmit", None),
     ("PreToolUse", None),
-    ("PostToolUse", Some(ASK_TOOL)),
+    ("PostToolUse", Some("askuserquestion|agentkill")),
     ("PostToolUseFailure", Some(ASK_TOOL)),
     ("Notification", Some("permission_prompt")),
     ("PermissionResult", None),
@@ -61,6 +65,9 @@ pub const HOOK_EVENTS: &[(&str, Option<&str>)] = &[
     ("PostCompact", None),
     ("SessionEnd", None),
 ];
+
+/// The flag that reopens a recorded conversation (`docs/cli.md`).
+const RESUME_FLAG: &str = "--resume";
 
 /// herdr's limits on a resume command: at most this many arguments, this
 /// many bytes in all.
@@ -131,6 +138,9 @@ pub struct Event {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// The call's arguments — read for the agent an `agentkill` stopped.
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
     #[serde(default)]
     pub notification_type: Option<String>,
     /// `SessionEnd`'s.
@@ -144,6 +154,27 @@ impl Event {
     pub fn parse(json: &str) -> Option<Self> {
         serde_json::from_str(json).ok()
     }
+
+    /// The agent an `agentkill` call names, read the way the tool reads it —
+    /// its aliases, trimmed — so the reporter and the registry agree on
+    /// which agent stopped.
+    fn killed_agent(&self) -> Option<String> {
+        let input = self.tool_input.clone()?;
+        let args: crate::llm::tools::AgentIdArgs = serde_json::from_value(input).ok()?;
+        Some(args.id().to_string()).filter(|id| !id.is_empty())
+    }
+}
+
+/// A prompt on screen waiting for the user, named by the call that raised it
+/// **and** the agent whose call it is — a call id is unique only within one
+/// conversation (Ollama numbers each round's calls from `call_0`), so the
+/// lead's prompt and a subagent's can carry the same one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Prompt {
+    /// The subagent that asked; `None` for the lead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub call: String,
 }
 
 /// What the reporter remembers between events — one file per pane.
@@ -152,9 +183,9 @@ pub struct State {
     /// Whether the lead's turn is running.
     #[serde(default)]
     pub turn: bool,
-    /// The prompts on screen waiting for the user, by tool call id.
+    /// The prompts on screen waiting for the user.
     #[serde(default)]
-    pub waiting: BTreeSet<String>,
+    pub waiting: BTreeSet<Prompt>,
     /// The last `seq` sent ([`next_seq`]).
     #[serde(default)]
     pub seq: u64,
@@ -227,7 +258,10 @@ pub enum Report {
 pub fn step(state: &mut State, event: &Event) -> Option<Report> {
     let lead = event.agent_id.is_none();
     let asks = event.tool_name.as_deref() == Some(ASK_TOOL);
-    let call = event.tool_use_id.clone();
+    let call = event.tool_use_id.clone().map(|call| Prompt {
+        agent: event.agent_id.clone(),
+        call,
+    });
     match event.name.as_str() {
         // A new conversation: nothing running, nothing asked. The `seq`
         // survives — herdr compares it across restarts.
@@ -253,6 +287,18 @@ pub fn step(state: &mut State, event: &Event) -> Option<Report> {
             if asks && let Some(call) = call {
                 state.waiting.remove(&call);
             }
+            // The lead stopped an agent: nothing will answer what that agent
+            // had on screen (and the screen withdraws it). A kill that failed
+            // stopped nothing.
+            if lead
+                && event.name == "PostToolUse"
+                && event.tool_name.as_deref() == Some(KILL_TOOL)
+                && let Some(killed) = event.killed_agent()
+            {
+                state
+                    .waiting
+                    .retain(|prompt| prompt.agent.as_deref() != Some(killed.as_str()));
+            }
         }
         "Notification" => {
             if event.notification_type.as_deref() != Some("permission_prompt") {
@@ -267,9 +313,12 @@ pub fn step(state: &mut State, event: &Event) -> Option<Report> {
                 state.waiting.remove(&call);
             }
         }
+        // The lead's turn ended, and with it anything of the lead's still
+        // counted as waiting; a background agent's prompt is still on screen.
         "Stop" | "StopFailure" => {
             if lead {
                 state.turn = false;
+                state.waiting.retain(|prompt| prompt.agent.is_some());
             }
         }
         // Esc tears the turn down, and every prompt it raised with it.
@@ -311,28 +360,47 @@ pub fn next_seq(state: &mut State, now_ns: u64) -> u64 {
     seq
 }
 
-/// The command that resumes `session` — `alter-zero --resume <id>` — or
-/// `None` when herdr would refuse it, which would refuse the state report
-/// it rides with too: the first word a plain command name (`[A-Za-z0-9_.-]`,
-/// not starting with `-`), no argument holding an apostrophe or a control
-/// character, at most 64 arguments and 8 KiB.
+/// The command herdr runs to bring the pane's agent back on a restore:
+/// `alter-zero --resume <id>` for a conversation with a rollout, else a bare
+/// `alter-zero` — a session that recorded nothing has nothing to resume, and
+/// a fresh start in the same directory is exactly what it was. Leaving the
+/// command off instead would let herdr keep the one it stored before: the
+/// conversation a `/clear` just left. An id herdr would refuse falls back the
+/// same way. `None` only when the program name itself is one herdr refuses
+/// (which would sink the state report the command rides with): a plain
+/// command name (`[A-Za-z0-9_.-]`, not starting with `-`), and no argument
+/// holding an apostrophe or a control character, at most 64 arguments and
+/// 8 KiB.
 #[must_use]
-pub fn resume_argv(program: &str, session: &str) -> Option<Vec<String>> {
+pub fn resume_argv(program: &str, session: Option<&str>) -> Option<Vec<String>> {
     let plain = !program.is_empty()
         && !program.starts_with('-')
         && program
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if !plain {
+        return None;
+    }
+    let fresh = vec![program.to_string()];
+    let Some(session) = session else {
+        return Some(fresh);
+    };
     let argv = vec![
         program.to_string(),
-        "--resume".to_string(),
+        RESUME_FLAG.to_string(),
         session.to_string(),
     ];
     let clean = argv
         .iter()
         .all(|arg| !arg.is_empty() && !arg.contains('\'') && !arg.chars().any(char::is_control));
     let bytes: usize = argv.iter().map(String::len).sum();
-    (plain && clean && argv.len() <= RESUME_MAX_ARGS && bytes <= RESUME_MAX_BYTES).then_some(argv)
+    Some(
+        if clean && argv.len() <= RESUME_MAX_ARGS && bytes <= RESUME_MAX_BYTES {
+            argv
+        } else {
+            fresh
+        },
+    )
 }
 
 /// The request line for `report` — one JSON object and its newline, the
@@ -350,10 +418,12 @@ pub fn request_line(pane: &Pane, report: &Report, seq: u64, program: &str) -> St
                 "state": state.label(),
                 "seq": seq,
             });
-            if let Some(session) = session
-                && let Some(argv) = resume_argv(program, session)
-            {
-                params["agent_session_id"] = json!(session);
+            if let Some(argv) = resume_argv(program, session.as_deref()) {
+                // The id rides beside the command that resumes it — never
+                // beside a fresh start's.
+                if argv.iter().any(|arg| arg == RESUME_FLAG) {
+                    params["agent_session_id"] = json!(session);
+                }
                 params["resume_argv"] = json!(argv);
             }
             json!({ "id": id, "method": "pane.report_agent", "params": params })
@@ -445,9 +515,21 @@ mod tests {
         }
     }
 
-    fn sub(mut event: Event) -> Event {
-        event.agent_id = Some("agent-1".to_string());
+    fn sub(event: Event) -> Event {
+        sub_as(event, "agent-1")
+    }
+
+    fn sub_as(mut event: Event, agent: &str) -> Event {
+        event.agent_id = Some(agent.to_string());
         event
+    }
+
+    /// The lead's `agentkill` of `agent`, as its `PostToolUse` reports it.
+    fn kill(agent: serde_json::Value) -> Event {
+        Event {
+            tool_input: Some(agent),
+            ..tool("PostToolUse", KILL_TOOL, "k1")
+        }
     }
 
     /// The states herdr hears for `events`, in order (a `None` step is
@@ -570,7 +652,9 @@ mod tests {
         // Parallel agents ask before any one is answered
         // (docs/permissions.md): answering the first leaves the second on
         // screen, and the order their hooks reach the reporter is theirs.
-        for (first, second) in [("c1", "c2"), ("c2", "c1")] {
+        let lead = tool("PermissionResult", "bash", "c1");
+        let agent = sub(tool("PermissionResult", "bash", "c2"));
+        for (first, second) in [(&lead, &agent), (&agent, &lead)] {
             let mut state = State::default();
             assert_eq!(
                 heard(
@@ -579,8 +663,8 @@ mod tests {
                         event("UserPromptSubmit"),
                         prompt("c1"),
                         sub(prompt("c2")),
-                        tool("PermissionResult", "bash", first),
-                        tool("PermissionResult", "bash", second),
+                        first.clone(),
+                        second.clone(),
                     ]
                 ),
                 vec!["working", "blocked", "blocked", "blocked", "working"]
@@ -632,6 +716,103 @@ mod tests {
     }
 
     #[test]
+    fn a_call_id_two_agents_share_still_names_two_prompts() {
+        // Ollama numbers every round's calls from `call_0`, in each
+        // conversation alike: the lead's prompt and two agents' can carry the
+        // same id, and answering one leaves the others on screen.
+        let mut state = State::default();
+        assert_eq!(
+            heard(
+                &mut state,
+                &[
+                    event("UserPromptSubmit"),
+                    prompt("call_0"),
+                    sub(prompt("call_0")),
+                    sub_as(prompt("call_0"), "agent-2"),
+                    tool("PermissionResult", "bash", "call_0"),
+                    sub(tool("PermissionResult", "bash", "call_0")),
+                    sub_as(tool("PermissionResult", "bash", "call_0"), "agent-2"),
+                ]
+            ),
+            vec![
+                "working", "blocked", "blocked", "blocked", "blocked", "blocked", "working"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_leads_turn_ending_takes_its_own_prompts_but_not_an_agents() {
+        // Nothing of the lead's can still be waiting once its turn ended, so
+        // whatever it left behind goes with it — a background agent's prompt
+        // is still on screen.
+        for end in ["Stop", "StopFailure"] {
+            let mut state = State::default();
+            assert_eq!(
+                heard(
+                    &mut state,
+                    &[event("UserPromptSubmit"), prompt("c1"), event(end)]
+                ),
+                vec!["working", "blocked", "idle"],
+                "{end}"
+            );
+            let mut state = State::default();
+            assert_eq!(
+                heard(
+                    &mut state,
+                    &[
+                        event("UserPromptSubmit"),
+                        prompt("c1"),
+                        sub(prompt("s1")),
+                        event(end),
+                        sub(tool("PermissionResult", "bash", "s1")),
+                    ]
+                ),
+                vec!["working", "blocked", "blocked", "blocked", "idle"],
+                "{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn killing_an_agent_takes_its_prompts_off_the_screen() {
+        // A stopped agent answers nothing: the lead's `agentkill` is the
+        // last its prompt is heard of.
+        let mut state = State::default();
+        assert_eq!(
+            heard(
+                &mut state,
+                &[
+                    event("UserPromptSubmit"),
+                    sub(prompt("s1")),
+                    sub_as(prompt("s2"), "agent-2"),
+                    kill(json!({ "agent_id": "agent-1" })),
+                    sub_as(tool("PermissionResult", "bash", "s2"), "agent-2"),
+                ]
+            ),
+            vec!["working", "blocked", "blocked", "blocked", "working"]
+        );
+        // The id as the model may spell it — the tool's own aliases, trimmed.
+        let mut state = State::default();
+        assert_eq!(
+            heard(
+                &mut state,
+                &[sub(prompt("s1")), kill(json!({ "id": " agent-1 " }))]
+            ),
+            vec!["blocked", "idle"]
+        );
+        // A kill that failed stopped nothing.
+        let mut state = State::default();
+        let failed = Event {
+            name: "PostToolUseFailure".to_string(),
+            ..kill(json!({ "agent_id": "agent-1" }))
+        };
+        assert_eq!(
+            heard(&mut state, &[sub(prompt("s1")), failed]),
+            vec!["blocked", "blocked"]
+        );
+    }
+
+    #[test]
     fn a_subagents_failed_round_is_not_the_turn_ending() {
         let mut state = State::default();
         assert_eq!(
@@ -678,7 +859,11 @@ mod tests {
     fn a_new_conversation_forgets_a_stale_turn_but_not_the_seq() {
         let mut state = State {
             turn: true,
-            waiting: ["c9".to_string()].into(),
+            waiting: [Prompt {
+                agent: None,
+                call: "c9".to_string(),
+            }]
+            .into(),
             seq: 41,
         };
         assert_eq!(heard(&mut state, &[event("SessionStart")]), vec!["idle"]);
@@ -777,7 +962,7 @@ mod tests {
     #[test]
     fn the_resume_command_obeys_herdrs_rules_or_is_left_off() {
         assert_eq!(
-            resume_argv("alter-zero", "19a8f3c2-1a2b"),
+            resume_argv("alter-zero", Some("19a8f3c2-1a2b")),
             Some(vec![
                 "alter-zero".to_string(),
                 "--resume".to_string(),
@@ -791,11 +976,38 @@ mod tests {
             "alter zero",
             "alter'zero",
         ] {
-            assert_eq!(resume_argv(program, "id"), None, "{program:?}");
+            assert_eq!(resume_argv(program, Some("id")), None, "{program:?}");
+            assert_eq!(resume_argv(program, None), None, "{program:?}");
         }
+    }
+
+    #[test]
+    fn with_nothing_to_resume_the_pane_restores_as_a_fresh_start() {
+        // No rollout yet — a new session, a `/clear` — so the command is a
+        // plain start in the same directory: a stale `--resume` herdr kept
+        // from before would reopen the conversation the user cleared.
+        let fresh = Some(vec!["alter-zero".to_string()]);
+        assert_eq!(resume_argv("alter-zero", None), fresh);
+        // An id herdr would refuse is no reason to keep the stale one either.
         for session in ["", "it's", "a\nb", &"x".repeat(9000)] {
-            assert_eq!(resume_argv("alter-zero", session), None, "{session:?}");
+            assert_eq!(
+                resume_argv("alter-zero", Some(session)),
+                fresh,
+                "{session:?}"
+            );
         }
+        let line = request_line(
+            &pane(),
+            &Report::State {
+                state: AgentState::Idle,
+                session: None,
+            },
+            5,
+            "alter-zero",
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["params"]["resume_argv"], json!(["alter-zero"]));
+        assert!(value["params"].get("agent_session_id").is_none());
     }
 
     #[test]
@@ -877,33 +1089,48 @@ mod tests {
         for (name, matcher) in HOOK_EVENTS {
             let event = HookEvent::from_name(name)
                 .unwrap_or_else(|| panic!("{name} is not an event the engine fires"));
-            let query = matcher.or(match event {
-                HookEvent::PreToolUse | HookEvent::PermissionResult => Some("bash"),
-                HookEvent::SessionStart => Some("startup"),
-                HookEvent::SessionEnd => Some("prompt_input_exit"),
-                HookEvent::PreCompact | HookEvent::PostCompact => Some("manual"),
-                HookEvent::StopFailure => Some("rate_limit"),
-                _ => None,
-            });
-            let selection = file.select(event, query);
-            assert!(
-                selection.warnings.is_empty(),
-                "{name}: {:?}",
-                selection.warnings
-            );
-            assert_eq!(selection.handlers.len(), 1, "{name}");
-            assert_eq!(selection.handlers[0].command, HOOK_COMMAND, "{name}");
+            let queries: Vec<Option<&str>> = match matcher {
+                Some(matcher) => matcher.split('|').map(Some).collect(),
+                None => vec![match event {
+                    HookEvent::PreToolUse | HookEvent::PermissionResult => Some("bash"),
+                    HookEvent::SessionStart => Some("startup"),
+                    HookEvent::SessionEnd => Some("prompt_input_exit"),
+                    HookEvent::PreCompact | HookEvent::PostCompact => Some("manual"),
+                    HookEvent::StopFailure => Some("rate_limit"),
+                    _ => None,
+                }],
+            };
+            for query in queries {
+                let selection = file.select(event, query);
+                assert!(
+                    selection.warnings.is_empty(),
+                    "{name}: {:?}",
+                    selection.warnings
+                );
+                assert_eq!(selection.handlers.len(), 1, "{name} {query:?}");
+                assert_eq!(selection.handlers[0].command, HOOK_COMMAND, "{name}");
+                assert_eq!(
+                    selection.handlers[0].timeout_secs, HOOK_TIMEOUT_SECS,
+                    "{name}"
+                );
+            }
+        }
+        // The question's end and the lead's `agentkill` — not every call's
+        // end, and not a kill that failed (it stopped nothing).
+        for (event, tool, heard) in [
+            (HookEvent::PostToolUse, ASK_TOOL, true),
+            (HookEvent::PostToolUseFailure, ASK_TOOL, true),
+            (HookEvent::PostToolUse, KILL_TOOL, true),
+            (HookEvent::PostToolUseFailure, KILL_TOOL, false),
+            (HookEvent::PostToolUse, "bash", false),
+            (HookEvent::PostToolUseFailure, "bash", false),
+        ] {
             assert_eq!(
-                selection.handlers[0].timeout_secs, HOOK_TIMEOUT_SECS,
-                "{name}"
+                !file.select(event, Some(tool)).handlers.is_empty(),
+                heard,
+                "{event:?} {tool}"
             );
         }
-        // The question's end alone — not every call's.
-        assert!(
-            file.select(HookEvent::PostToolUse, Some("bash"))
-                .handlers
-                .is_empty()
-        );
         assert!(
             file.select(HookEvent::Notification, Some("idle_prompt"))
                 .handlers

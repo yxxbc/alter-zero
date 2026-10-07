@@ -97,6 +97,25 @@ impl HookOutcome {
         *self == Self::default()
     }
 
+    /// Did these answers stop `event` from happening? A refused call
+    /// (`PreToolUse` blocked or denied), a refused prompt (`UserPromptSubmit`
+    /// blocked, or `continue: false`), a stop turned into a continuation
+    /// (`Stop`/`SubagentStop` blocked — unless `continue: false` outranks the
+    /// block and the turn really ends). Every other event happens whatever a
+    /// hook says: a post-call block is feedback on a call that already ran.
+    /// What decides whether the integration layer hears of the event at all
+    /// (`docs/hooks.md` *Integrations*).
+    #[must_use]
+    pub fn prevents(&self, event: HookEvent) -> bool {
+        let blocked = self.block_reason.is_some();
+        match event {
+            HookEvent::PreToolUse => blocked,
+            HookEvent::UserPromptSubmit => blocked || self.stopped,
+            HookEvent::Stop | HookEvent::SubagentStop => blocked && !self.stopped,
+            _ => false,
+        }
+    }
+
     /// The `additionalContext` entries as one block, or `None` when there
     /// were none.
     #[must_use]
@@ -754,6 +773,52 @@ mod tests {
             ..ParsedHook::default()
         }]);
         assert!(!outcome.is_quiet());
+    }
+
+    // --- vetoes ---
+
+    #[test]
+    fn only_a_refused_call_prompt_or_stop_counts_as_a_vetoed_event() {
+        let blocked = HookOutcome {
+            block_reason: Some("no".into()),
+            ..HookOutcome::default()
+        };
+        let stopped = HookOutcome {
+            stopped: true,
+            ..HookOutcome::default()
+        };
+        let both = HookOutcome {
+            stopped: true,
+            ..blocked.clone()
+        };
+        // A refused call, a refused prompt (either way it is refused), and a
+        // stop turned into a continuation.
+        assert!(blocked.prevents(HookEvent::PreToolUse));
+        assert!(blocked.prevents(HookEvent::UserPromptSubmit));
+        assert!(stopped.prevents(HookEvent::UserPromptSubmit));
+        assert!(blocked.prevents(HookEvent::Stop));
+        assert!(blocked.prevents(HookEvent::SubagentStop));
+        // `continue: false` on a Stop outranks its block — the turn really
+        // ends — and never refuses a call on its own.
+        assert!(!both.prevents(HookEvent::Stop));
+        assert!(!both.prevents(HookEvent::SubagentStop));
+        assert!(!stopped.prevents(HookEvent::Stop));
+        assert!(!stopped.prevents(HookEvent::PreToolUse));
+        // Everything else happens whatever a hook says: a post-call block is
+        // feedback on a call that already ran.
+        for &event in HookEvent::ALL {
+            if !matches!(
+                event,
+                HookEvent::PreToolUse
+                    | HookEvent::UserPromptSubmit
+                    | HookEvent::Stop
+                    | HookEvent::SubagentStop
+            ) {
+                assert!(!blocked.prevents(event), "{event:?}");
+                assert!(!stopped.prevents(event), "{event:?}");
+            }
+            assert!(!HookOutcome::default().prevents(event), "{event:?}");
+        }
     }
 
     // --- truncation ---

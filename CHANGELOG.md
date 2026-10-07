@@ -20,21 +20,28 @@ release heading when a version is cut.
   `blocked` while a permission prompt or a question waits on you, and
   `idle` when it is your turn, so herdr's notifications fire when the agent
   finishes or needs a decision. After a herdr server restart, the pane comes
-  back running `alter-zero --resume` on the same conversation. It works
-  entirely through lifecycle hooks: the command installs a hooks file whose
-  hooks run a small reporter, which talks to herdr's local socket and does
-  nothing outside herdr. `alter-zero integration status` shows whether it is
-  installed and whether the current terminal is a herdr pane, and
-  `alter-zero integration uninstall herdr` removes it (`docs/herdr.md`).
+  back running `alter-zero --resume` on the same conversation, or a fresh
+  `alter-zero` when the conversation had nothing recorded yet. Parallel
+  agents' prompts each count until each is answered, and a prompt your own
+  hooks refuse, or a stop they turn into another round, never changes what
+  herdr shows. It works entirely through lifecycle hooks: the command
+  installs a hooks file whose hooks run a small reporter, which talks to
+  herdr's local socket and does nothing outside herdr. `alter-zero
+  integration status` shows whether it is installed and whether the current
+  terminal is a herdr pane, and `alter-zero integration uninstall herdr`
+  removes it (`docs/herdr.md`).
 - **Integrations get a hooks layer that runs in every directory.** Files in
   `~/.alter-zero/hooks.d/` are hooks files like `hooks.json`, merged after
   it, and they run whatever the per-directory **Hooks** row in `/settings`
   says: a hook that connects Alter Zero to your terminal belongs to every
   project, while your own `hooks.json` still runs only where you turned it
-  on. `ALTER_ZERO_HOOKS=0` still turns every hook off. `/hooks` labels these
+  on. They run after your own hooks, and not for a call, a prompt or a stop
+  your hooks refused, since an integration reports what happened.
+  `ALTER_ZERO_HOOKS=0` still turns every hook off. `/hooks` labels these
   entries `Integration` and names their file (`docs/hooks.md`).
 - **Five more lifecycle hook events.** `Interrupt` fires when Esc stops a
-  turn, and `StopFailure` when a turn ends on an error, with the error type
+  turn, or when `/clear` or quitting cuts one short (before their
+  `SessionEnd`), and `StopFailure` when a turn ends on an error, with the error type
   (`rate_limit`, `overloaded`, `authentication_failed`, …) as its matcher.
   Before, both ended a turn without any event, so a status hook stayed at
   "working". `Notification` (`permission_prompt`) fires when a permission
@@ -88,6 +95,28 @@ release heading when a version is cut.
   offline demo runs no hooks, but `/clear` and quitting still fired
   `SessionEnd` there, an end with no start. It now fires only after a real
   model has been used, as `docs/hooks.md` already said.
+- **A hook that starts a background process no longer stalls the session.**
+  A hook running `server &` without redirecting its output left that
+  process holding the hook's output, and Alter Zero waited for it to exit
+  before running anything else, so a `SessionStart` hook like that held up
+  the first turn indefinitely. A hook now counts as finished when its own
+  process exits, and the process it started keeps running (`docs/hooks.md`).
+- **No hook runs after the session's `SessionEnd`.** Quitting stopped
+  background agents only after `SessionEnd`, so a tool call one of them made
+  meanwhile could fire its hooks once the session had ended.
+- **A session's first prompt tells its hooks where the transcript is.** The
+  first `UserPromptSubmit` of a conversation carried `transcript_path: null`
+  because the recording was created just after the hook ran. It is now
+  created first.
+- **A real prompt always fires `UserPromptSubmit`.** The follow-up turn
+  Alter Zero starts on its own after a background job finishes skips that
+  event, but when no hook consumed the skip (hooks off, or no model
+  connected yet), it carried over and silenced your next prompt's event.
+- **Stopping an agent takes its permission prompt off the screen.** When the
+  lead agent stopped a subagent with `agentkill` (or you stopped it from the
+  agent list) while its permission prompt was open, the prompt stayed, and
+  answering it did nothing. The prompt now closes and the next one opens
+  (`docs/permissions.md`).
 - **A background notice now sits where the model actually read it.** A
   background command that finished while the model was writing its next tool
   call reached the model only after that call's result, but the transcript

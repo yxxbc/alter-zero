@@ -251,7 +251,12 @@ described after the list:
   the echo away, and commits a red reason-only notice. `additionalContext`
   injects even on a block — both references' rule. A loop-initiated turn (a
   background completion's follow-up) is marked synthetic and skips the
-  event: its prompt is not the user's. The backend consults its retained
+  event: its prompt is not the user's. The mark is dropped before every
+  user turn, so one a hook-less turn never consumed (the offline demo's, or
+  one run with hooks off) cannot silence the next real prompt's event. The
+  turn's rollout is written before its thread starts, so even this first
+  event names the transcript — codex's rule, *the file exists before the
+  hook runs*. The backend consults its retained
   request prefix only past this check, so a block costs no prompt-cache
   prefix (`docs/prompt-caching.md`).
 - **`PreCompact`/`PostCompact`** ride the summarization spawn through the
@@ -270,11 +275,14 @@ described after the list:
   clamps it to 3 s, because quitting must never hang on a hook. Output is
   ignored, as in both references. A quit drops whatever the lane still
   holds and reaps its running job first, so a slow `SessionStart` cannot
-  spend the budget.
+  spend the budget. A `/clear` or a quit that cuts a turn short fires that
+  turn's `Interrupt` first — codex's order on a shutdown — so a hook that
+  heard the turn start always hears it end.
 - **`Interrupt`** (codex's event) fires when an Esc stops an agent turn —
-  whether it kept what streamed or undid the submission — on the lane,
-  under the same 2 s budget, output ignored. A `!` shell turn fires nothing
-  (it never told the hooks it started). Without it a status tracker saw a
+  whether it kept what streamed or undid the submission — and when a
+  `/clear` or a quit cuts one short, ahead of their `SessionEnd`; on the
+  lane, under the same 2 s budget, output ignored. A `!` shell turn fires
+  nothing (it never told the hooks it started). Without it a status tracker saw a
   turn start and never end: Esc fired nothing at all — the bug codex fixed
   by adding this event (openai/codex#22858).
 - **`StopFailure`** (Claude Code's) fires when a round fails — the
@@ -300,7 +308,9 @@ described after the list:
   Code's event) naming who decided it — the user, a `PermissionRequest`
   hook, or the classifier. A standing rule decides nothing, so it raises
   neither; a request reaped by Esc gets no result (the `Interrupt` that
-  follows is the record). The `Notification` is queued on the lane under
+  follows is the record), and neither does one whose agent the lead
+  stopped — the prompt leaves the screen with its agent, and the lead's
+  `agentkill` call is the record. The `Notification` is queued on the lane under
   the **turn's** token rather than run inline: the gate waits at once, the
   `Interrupt` of an Esc on that very prompt can never reach a hook before
   it — a tracker would read *idle*, then *blocked*, and show a prompt
@@ -335,8 +345,11 @@ can still write, and a status reporter mid-flight would land its *working*
 after the `Interrupt`'s *idle*. So every backend dispatch registers its
 turn's token while it runs (`llm::hooks::InFlight`), and the `Interrupt` and
 `SessionEnd` jobs first wait (`REAP_WAIT`, 1 s at most) until no running
-dispatch belongs to a cancelled turn. A quit cancels a running turn before
-it fires `SessionEnd`, so the same wait covers it; a background agent's
+dispatch belongs to a cancelled turn. A quit cancels a running turn **and
+every subagent** before it fires `SessionEnd`, so the same wait covers them
+all and no hook of the session lands after its end — a background agent's
+tool call used to, putting a herdr pane's agent back after the release. An
+Esc's `Interrupt` waits only for the turn it ended: a background agent's
 hooks, whose turn nothing ended, are never waited for. The prompt's
 `Notification` gets the guarantee from the lane itself: it is a job, so the
 `Interrupt` queues behind it.
@@ -348,6 +361,15 @@ polls on the same 20 ms cadence — the payload write included, on its own
 thread, since a pipe-buffer-filling payload fed to a handler that never
 reads stdin used to park an inline write past both Esc and the timeout —
 and kills the process group on cancel, so Esc stays prompt.
+
+**A hook is over when its process is.** Its output pipes normally close
+with it, but a process it left running holds them for as long as it lives:
+a `SessionStart` hook that starts `npm run dev &` without a redirect kept
+the runner waiting for an end of file that never came — and on the lane,
+every hook after it waited too, which stopped the session's first turn
+cold. The runner now takes what was read within `PIPE_DRAIN_GRACE` (1 s)
+of the exit and leaves its readers to drain the rest into nothing; the
+process itself is left alone, as `nohup` would have it.
 
 ## How a verdict reaches the screen
 
@@ -495,6 +517,8 @@ directory opts in — one cycle records `"hooks": true` in its `settings.json`
 entry. `ALTER_ZERO_HOOKS` seeds the row for a run (`=1` on, a falsy value
 off — the `ALTER_ZERO_TOOLS` pattern) and is never saved.
 
+### Integrations
+
 **A third layer runs everywhere: `{config_home}/hooks.d/`.** The row is
 right for `hooks.json`, which holds a user's guards and formatters, and
 wrong for an **integration** — a hook that connects Alter Zero to the
@@ -509,6 +533,23 @@ it lives in the config home, beside the `hooks.json` that is trusted for
 the same reason. A file that will not parse is a red startup toast naming
 it, and the others still load. `/hooks` labels its entries `Integration`
 and names their file on the detail page (`docs/hooks-menu.md`).
+
+**The layer observes.** Its handlers run after every other handler of the
+event, and **not at all for an event those stopped** (`HooksFile::observing`
+marks the loaded files, `HookOutcome::prevents` decides): a call a
+`PreToolUse` hook refused, a prompt a `UserPromptSubmit` hook refused, a
+`Stop` a hook turned into another round (unless `continue: false` outranks
+the block — then the turn really ends). An integration reports what the
+session does, and none of those happened: before this, a refused prompt
+left a herdr pane *working* with no turn running, a refused question left
+it *blocked*, and a Stop hook's extra round ran on a pane that said *idle*.
+Every other event happens whatever a hook says — a post-call block is
+feedback on a call that already ran — so the layer always hears it. The
+handlers stay synchronous, like herdr's own integrations: deferring them
+as `"async": true` jobs onto a background lane gets the same skip, but lets
+the `PermissionResult` of a prompt an Esc dismissed reach a tracker after
+that Esc's `Interrupt`, which leaves the pane *working* with nothing
+running.
 
 ## Module layout
 
@@ -575,7 +616,10 @@ point of the design; if a later change breaks it, the change is wrong.
   warning rather than failing the file.
 - **Async (fire-and-forget) handlers.** Every v1 hook is synchronous. The
   `"async": true` flag parses and is ignored, with a warning. The
-  bounded-concurrency pool codex uses is a phase-two concern.
+  bounded-concurrency pool codex uses is a phase-two concern — and the one
+  integration that would use it, a status reporter, needs order more than speed:
+  both references run async handlers unordered, and herdr's own
+  integrations are synchronous with a 0.5 s socket timeout, like ours.
 - **Output spilling.** codex writes an oversized `additionalContext` to disk
   with a preview. We cap and truncate (`HOOK_OUTPUT_MAX_BYTES`) instead until
   someone needs more.
@@ -619,12 +663,16 @@ Three layers cover the rest:
 - the **pure core** is unit-tested from fixtures with no process anywhere;
 - the **runner** has real-`sh` tests beside `llm::exec`'s — a hook reading the
   payload off stdin and blocking on what it finds, a timeout being reaped, a
-  cancelled turn reaping a running hook, a missing command failing open —
+  cancelled turn reaping a running hook, a missing command failing open, a
+  process a hook left holding its output never holding the event up, an
+  integration never hearing an event another hook vetoed and running after
+  the rest of one that went ahead —
   and the lane's: jobs in submission order, a dispatch never overtaking an
   `Interrupt`, an `Interrupt` never landing ahead of the prompt it closed
   (while the turn's Esc still reaps that prompt's hung notifier), a quit
-  that reaps a slow `SessionStart` before its `SessionEnd`, and a payload
-  naming the conversation it was fired for;
+  that reaps a slow `SessionStart` before its `SessionEnd`, a quit that cut
+  a turn short firing its `Interrupt` first, and a payload naming the
+  conversation it was fired for;
 - the **wiring** has `run_agent` and `approve_call` tests over fake sinks —
   `PostToolUseFailure` for a failed call only, `StopFailure` classified and
   sent before the error, `Notification` then `PermissionResult` around a
@@ -640,7 +688,11 @@ runs against a stub provider: **Phase 132** installs the herdr integration
 and reads the reporter's requests off a stub herdr socket — `SessionStart`
 at launch, a turn's `UserPromptSubmit` and `Stop`, a prompt's
 `Notification`, an Esc's `Interrupt` and the quit's `SessionEnd`, in that
-order, each carrying the conversation's resumable id (`docs/herdr.md`).
+order, each carrying the conversation's resumable id (`docs/herdr.md`) —
+then, beside a user hooks file, that a prompt the user's hook refuses never
+reaches the integration, that a Stop hook's extra round keeps the pane
+*working*, and that a `/clear` and a quit mid-turn each fire `Interrupt`
+before their `SessionEnd`.
 
 ## Deliberate deviations from the references
 
@@ -685,9 +737,11 @@ Verified against both sources, and chosen — not accidental:
   `askuserquestion` is a tool call, which `PreToolUse` already announces. A
   config naming an unmodelled event loads fine and never fires.
 - **No event follows a prompt another hook refused.** When one
-  `UserPromptSubmit` handler blocks the prompt, its siblings have already
-  run — a tracker one of them told *working* stays there until the next
-  turn. Neither reference fires anything after a refused prompt either.
+  `UserPromptSubmit` handler blocks the prompt, its siblings in the user's
+  and the project's files have already run — a tracker one of them told
+  *working* stays there until the next turn. Neither reference fires
+  anything after a refused prompt either. The integration layer is spared:
+  it runs last, and not for a refused prompt (*Integrations*).
 - **A PermissionRequest hook that abstains loses its warnings** — the
   fail-open posture has no channel to the user from that position; a
   deciding verdict carries them on its note.

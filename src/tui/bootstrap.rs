@@ -572,6 +572,7 @@ impl<'t> Session<'t> {
             settings_path,
             tips_saved: Some(tips_file.next),
             inflight: None,
+            inflight_hooked: false,
             reaping: Vec::new(),
             clipboard_lease: None,
             overlay_resized: false,
@@ -918,15 +919,24 @@ impl<'t> Session<'t> {
         // (the reap below is unchanged), so its hooks are reaped ahead of
         // SessionEnd, which waits for them — none lands after it
         // (docs/hooks.md *The lane*; a tracker would hear *working* from a
-        // session that had released its pane, docs/herdr.md).
+        // session that had released its pane, docs/herdr.md). A turn the
+        // hooks heard start hears its end too: `Interrupt`, then SessionEnd —
+        // codex's order on a shutdown.
+        let interrupted = self.hooked_turn_in_flight();
         if let Some((cancel, _)) = &self.inflight {
             cancel.cancel();
         }
+        // …and every subagent, for the same reason: a background agent's
+        // tool call is a hook too, and one landing after the release would
+        // put the pane's agent back for a session that is gone
+        // (docs/agent-tool.md — their threads die with the process anyway;
+        // the cancel stops their in-flight requests promptly).
+        self.agent_registry.kill_all();
         // SessionEnd (docs/hooks.md): fired before the teardown below and
         // waited for under its bounded budget, whatever the hooks' lane still
         // held dropped first — so a quit never hangs on a hook. Claude Code's
         // closest reason for an interactive quit is `prompt_input_exit`.
-        self.models.end_session_at_exit();
+        self.models.end_session_at_exit(interrupted);
         let inputs = self.app.take_unpersisted_inputs();
         self.hist_store.append(&inputs);
         // …and the tip walk's position, for a quit that drew a tip on its way
@@ -959,11 +969,9 @@ impl<'t> Session<'t> {
         self.models.cancel_model_fetch();
         // Kill every background shell on the way out — the sweep is synchronous
         // (direct process-group kills), so quitting can't orphan a `ping`
-        // (docs/background.md) — and cancel every subagent (their threads observe
-        // the token and die with the process either way; the cancel stops their
-        // in-flight requests promptly — docs/agent-tool.md).
+        // (docs/background.md). The subagents were cancelled above, ahead of
+        // SessionEnd.
         self.registry.kill_all();
-        self.agent_registry.kill_all();
         // Tear down the MCP connections (docs/mcp.md): drops every transport
         // — killing the stdio children synchronously — and cancels a running
         // auth flow, so quitting can't orphan a server process.

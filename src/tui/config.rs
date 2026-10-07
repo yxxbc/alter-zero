@@ -416,10 +416,12 @@ pub(crate) fn hook_integrations_dir() -> Option<PathBuf> {
 
 /// Load the integration layer (`docs/herdr.md`): every `*.json` in `dir`, in
 /// file-name order, each a whole `hooks.json` an installer wrote — the files
-/// whose hooks run in every directory, whatever the **Hooks** row says. A
-/// file that will not parse is reported (the message names it) and skipped,
-/// the others still load: one broken integration must not take its siblings
-/// down. A missing directory is the normal case, and no layer.
+/// whose hooks run in every directory, whatever the **Hooks** row says, and
+/// which **observe**: they run after the user's and the project's hooks, and
+/// not for an event those refused (`HooksFile::observing`). A file that will
+/// not parse is reported (the message names it) and skipped, the others
+/// still load: one broken integration must not take its siblings down. A
+/// missing directory is the normal case, and no layer.
 pub(crate) fn load_hook_integrations(
     dir: Option<&Path>,
 ) -> (Vec<(PathBuf, alter_zero::hooks::HooksFile)>, Vec<String>) {
@@ -452,7 +454,7 @@ pub(crate) fn load_hook_integrations(
             .map_err(|err| err.to_string())
             .and_then(|text| alter_zero::hooks::HooksFile::parse(&text))
         {
-            Ok(file) => layers.push((path, file)),
+            Ok(file) => layers.push((path, file.observing())),
             Err(err) => errors.push(format!("hooks.d/{name}: {err} — skipped")),
         }
     }

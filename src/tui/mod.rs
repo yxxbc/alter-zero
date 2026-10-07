@@ -362,6 +362,10 @@ pub(crate) struct Session<'t> {
     // ----- the in-flight turn -----
     /// The streaming reply's cancel token + thread handle; `None` when idle.
     inflight: Option<(CancelToken, JoinHandle<()>)>,
+    /// Whether that turn told the hooks it started — a model turn or a
+    /// compaction, never a `!` command — so cutting it short (`/clear`, a
+    /// quit) owes them an `Interrupt` (`docs/hooks.md`).
+    inflight_hooked: bool,
     /// Backend threads whose turn was interrupted or `/clear`ed: cancelled and
     /// **detached**, swept here when finished. Never joined on the loop — that
     /// was the interrupt-lag freeze (`docs/interrupt.md`).

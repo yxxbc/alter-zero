@@ -147,6 +147,17 @@ impl Session<'_> {
             self.app.listings.as_deref(),
             &self.app.history,
         );
+        // The rollout exists before the turn's thread does (codex's rule: the
+        // file exists before the hook runs), so the turn's first hook — its
+        // `UserPromptSubmit` — already names the transcript: a session
+        // tracker can resume the conversation from its first *working*, not
+        // only from its first *idle* (docs/herdr.md). The loop-bottom sync
+        // that would otherwise create it then has nothing left to write.
+        self.recorder
+            .sync(&self.app.history, self.app.history_generation());
+        // A real prompt is the user's, whatever a loop-initiated turn left
+        // marked (docs/hooks.md).
+        self.models.clear_synthetic_turn();
         self.spawn_reply(prompt, paths, context);
     }
 
@@ -200,6 +211,8 @@ impl Session<'_> {
             self.registry.clone(),
         );
         self.inflight = Some((cancel, handle));
+        // A `!` command tells the hooks nothing (docs/hooks.md).
+        self.inflight_hooked = false;
     }
 
     /// Start the automatic follow-up turn for background completions the model
@@ -284,6 +297,8 @@ impl Session<'_> {
             cancel.clone(),
         );
         self.inflight = Some((cancel, handle));
+        // Its `PreCompact` is the start the hooks heard.
+        self.inflight_hooked = true;
     }
 
     /// Spawn the session backend on `prompt` and hold the turn's cancel token +
@@ -301,6 +316,16 @@ impl Session<'_> {
                 .backend()
                 .spawn(prompt, images, context, self.tx.clone(), cancel.clone());
         self.inflight = Some((cancel, handle));
+        self.inflight_hooked = true;
+    }
+
+    /// Whether a turn the hooks heard start is running — what `/clear` and a
+    /// quit owe an `Interrupt` when they cut it short (codex's order on a
+    /// shutdown: the interrupted turn's end, then the session's,
+    /// `docs/hooks.md`). Read before [`Session::abandon_inflight`] takes the
+    /// slot.
+    pub(crate) fn hooked_turn_in_flight(&self) -> bool {
+        self.inflight.is_some() && self.inflight_hooked
     }
 
     /// The every-turn-end dispatch (`docs/background.md`, `docs/queue.md`):

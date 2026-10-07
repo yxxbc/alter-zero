@@ -145,9 +145,14 @@ fn a_turn_reaches_herdr_as_working_then_idle_with_the_resume_command() {
     assert_eq!(start["params"]["source"], json!("alter-zero"));
     assert_eq!(start["params"]["agent"], json!("alter-zero"));
     assert_eq!(start["params"]["state"], json!("idle"));
+    assert_eq!(
+        start["params"]["resume_argv"],
+        json!(["alter-zero"]),
+        "no rollout yet: a restore starts afresh in the same directory"
+    );
     assert!(
-        start["params"].get("resume_argv").is_none(),
-        "no rollout yet, nothing to resume: {start}"
+        start["params"].get("agent_session_id").is_none(),
+        "nothing to resume: {start}"
     );
 
     report(config.path(), &herdr, &recorded("UserPromptSubmit"), &[]);
@@ -207,6 +212,65 @@ fn a_prompt_blocks_across_the_separate_processes_the_hooks_are() {
     );
     report(config.path(), &herdr, &recorded("Interrupt"), &[]);
     assert_eq!(states(&herdr, "the interrupt"), json!("idle"));
+}
+
+#[test]
+fn the_lead_and_an_agent_sharing_a_call_id_are_two_prompts_across_processes() {
+    // Ollama numbers every round's calls from `call_0`: the lead's prompt
+    // and a subagent's share the id, and the pane's state file keeps them
+    // apart from one hook process to the next.
+    let config = tempfile::tempdir().unwrap();
+    let herdr = Herdr::start();
+    let states =
+        |herdr: &Herdr, what: &str| -> Value { herdr.next(what)["params"]["state"].clone() };
+    let by = |mut value: Value, agent: Option<&str>| {
+        if let Some(agent) = agent {
+            value["agent_id"] = json!(agent);
+            value["agent_type"] = json!("general-purpose");
+        }
+        value
+    };
+    let prompt = |agent| {
+        by(
+            on(
+                recorded("Notification"),
+                &[
+                    ("notification_type", json!("permission_prompt")),
+                    ("tool_name", json!("bash")),
+                    ("tool_use_id", json!("call_0")),
+                ],
+            ),
+            agent,
+        )
+    };
+    let answered = |agent| {
+        by(
+            on(
+                recorded("PermissionResult"),
+                &[
+                    ("tool_name", json!("bash")),
+                    ("tool_use_id", json!("call_0")),
+                    ("decision", json!({"behavior": "allow", "source": "user"})),
+                ],
+            ),
+            agent,
+        )
+    };
+
+    report(config.path(), &herdr, &recorded("UserPromptSubmit"), &[]);
+    assert_eq!(states(&herdr, "the prompt"), json!("working"));
+    report(config.path(), &herdr, &prompt(None), &[]);
+    assert_eq!(states(&herdr, "the lead's prompt"), json!("blocked"));
+    report(config.path(), &herdr, &prompt(Some("a1")), &[]);
+    assert_eq!(states(&herdr, "the agent's prompt"), json!("blocked"));
+    report(config.path(), &herdr, &answered(None), &[]);
+    assert_eq!(
+        states(&herdr, "the lead's answer"),
+        json!("blocked"),
+        "the agent's prompt is still on screen"
+    );
+    report(config.path(), &herdr, &answered(Some("a1")), &[]);
+    assert_eq!(states(&herdr, "the agent's answer"), json!("working"));
 }
 
 #[test]
