@@ -17,7 +17,7 @@
 //! differently and both references agree on the asymmetry, so it is copied
 //! exactly: the **payload is `snake_case`**, the **verdict is `camelCase`**.
 //!
-//! - `event`   — the eleven [`HookEvent`]s and their wire names.
+//! - `event`   — the sixteen [`HookEvent`]s and their wire names.
 //! - `config`  — the `hooks.json` file format and handler selection.
 //! - `matcher` — which handlers an event's match query selects.
 //! - `payload` — the per-event stdin JSON.
@@ -40,9 +40,11 @@ pub use self::overview::{
     MatcherOverview, event_description, event_has_matchers, event_summary,
 };
 pub use self::payload::{
-    HookContext, permission_request_payload, post_compact_payload, post_tool_use_payload,
-    pre_compact_payload, pre_tool_use_payload, session_end_payload, session_start_payload,
-    stop_payload, subagent_start_payload, subagent_stop_payload, user_prompt_submit_payload,
+    HookContext, interrupt_payload, notification_payload, permission_request_payload,
+    permission_result_payload, post_compact_payload, post_tool_use_failure_payload,
+    post_tool_use_payload, pre_compact_payload, pre_tool_use_payload, session_end_payload,
+    session_start_payload, stop_failure_payload, stop_payload, subagent_start_payload,
+    subagent_stop_payload, user_prompt_submit_payload,
 };
 pub use self::verdict::{
     HOOK_OUTPUT_MAX_BYTES, HookOutcome, HookPermission, HookRun, ParsedHook, merge, parse_run,

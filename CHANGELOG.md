@@ -14,6 +14,40 @@ release heading when a version is cut.
 
 ### Added
 
+- **Alter Zero tells [herdr](https://herdr.dev) what it is doing.** Run
+  `alter-zero integration install herdr` once, and an Alter Zero session in
+  a herdr pane shows in herdr's sidebar as `working` while a turn runs,
+  `blocked` while a permission prompt or a question waits on you, and
+  `idle` when it is your turn, so herdr's notifications fire when the agent
+  finishes or needs a decision. After a herdr server restart, the pane comes
+  back running `alter-zero --resume` on the same conversation. It works
+  entirely through lifecycle hooks: the command installs a hooks file whose
+  hooks run a small reporter, which talks to herdr's local socket and does
+  nothing outside herdr. `alter-zero integration status` shows whether it is
+  installed and whether the current terminal is a herdr pane, and
+  `alter-zero integration uninstall herdr` removes it (`docs/herdr.md`).
+- **Integrations get a hooks layer that runs in every directory.** Files in
+  `~/.alter-zero/hooks.d/` are hooks files like `hooks.json`, merged after
+  it, and they run whatever the per-directory **Hooks** row in `/settings`
+  says: a hook that connects Alter Zero to your terminal belongs to every
+  project, while your own `hooks.json` still runs only where you turned it
+  on. `ALTER_ZERO_HOOKS=0` still turns every hook off. `/hooks` labels these
+  entries `Integration` and names their file (`docs/hooks.md`).
+- **Five more lifecycle hook events.** `Interrupt` fires when Esc stops a
+  turn, and `StopFailure` when a turn ends on an error, with the error type
+  (`rate_limit`, `overloaded`, `authentication_failed`, …) as its matcher.
+  Before, both ended a turn without any event, so a status hook stayed at
+  "working". `Notification` (`permission_prompt`) fires when a permission
+  prompt opens and `PermissionResult` when it is answered, naming who
+  decided: you, a hook or auto mode's classifier. `PostToolUseFailure` is
+  `PostToolUse` for a call that failed, a declined question included. Each
+  takes its payload from Claude Code, codex or Kimi Code, so hooks written
+  for those tools read it unchanged (`docs/hooks.md`).
+- **Hooks are told where the running binary is.** Every hook gets
+  `ALTER_ZERO_BIN_PATH`, so a hook that calls back into Alter Zero needs no
+  absolute path that goes stale when the binary moves or updates. Payloads
+  also carry `scratchpad_dir`, the session's temp directory
+  (`docs/hooks.md`).
 - **A built-in `yt-dlp` skill guides media downloads without bundling a downloader.**
   On first launch its editable `SKILL.md` is seeded beside the other built-ins;
   the agent can load it on demand for videos, playlists, captions and audio.
@@ -21,8 +55,39 @@ release heading when a version is cut.
   unless a playlist was requested, asks before using browser cookies and
   verifies output files before reporting success (`docs/skills.md`).
 
+### Changed
+
+- **`SessionStart` hooks run when the session opens.** They used to wait for
+  your first message, so anything watching the session learned of it only
+  then. They now start in the background as soon as the first screen is
+  drawn, and again on `/clear`, `/resume` and the `/login` that first
+  connects a model, without delaying the screen or the keyboard. The first
+  turn still waits for them, so their extra context reaches it as before.
+- **A hook's `session_id` is the conversation's id, the one `--resume`
+  takes.** Payloads used to carry an id the conversation's recording never
+  used, so a hook could not resume the session it was told about. The id
+  now names the conversation: a fresh one after `/clear`, the resumed one
+  after `/resume`. A hook that used the id to find the session's temp files
+  should read the new `scratchpad_dir` field instead, since the temp
+  directory keeps the session's first id.
+- **`/resume` ends the conversation it replaces.** Loading another
+  conversation fires `SessionEnd` with the reason `resume` before the
+  resumed conversation's `SessionStart`, as `/clear` already did with
+  `clear`.
+
 ### Fixed
 
+- **Ending a session no longer freezes the screen while its hooks run.**
+  `/clear` ran `SessionEnd` hooks on the UI thread for up to two seconds.
+  The session's start and end events, and the new interrupt event, now run
+  in the background in the order they happened, and a turn's own hooks wait
+  for them, so no hook hears about a new turn before the interrupt that
+  ended the last one. Quitting still waits for `SessionEnd`, for about two
+  seconds at most (`docs/hooks.md`).
+- **A session that never connected a model fires no `SessionEnd`.** The
+  offline demo runs no hooks, but `/clear` and quitting still fired
+  `SessionEnd` there, an end with no start. It now fires only after a real
+  model has been used, as `docs/hooks.md` already said.
 - **A background notice now sits where the model actually read it.** A
   background command that finished while the model was writing its next tool
   call reached the model only after that call's result, but the transcript

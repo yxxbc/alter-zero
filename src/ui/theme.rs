@@ -1584,11 +1584,13 @@ pub(super) const HOOKS_DESC_GAP: usize = 3;
 pub(super) const HOOKS_INFO: &str = "ℹ This menu is read-only. To add or modify hooks, \
 edit hooks.json directly or ask alter-zero. See docs/hooks.md";
 
-/// The note when the file holds hooks but the session has them off
+/// The note when `hooks.json` holds hooks but the session has them off
 /// (`/settings`, `ALTER_ZERO_HOOKS=0`) — the reference's restricted-by-policy
-/// slot, red because every listed guard is currently not running.
+/// slot, red because every one of those guards is currently not running. It
+/// names the file because an integration's hooks (`hooks.d/`) still run
+/// beside it (`docs/herdr.md`).
 pub(super) const HOOKS_DISABLED_NOTE: &str =
-    "Hooks are disabled this session — enable them in /settings";
+    "Hooks in hooks.json are off this session — enable them in /settings";
 
 /// The empty state (an event with nothing configured), two dim lines.
 pub(super) const HOOKS_EMPTY: &str = "No hooks configured for this event.";
@@ -1606,6 +1608,11 @@ pub(super) const HOOKS_DETAIL_HINT: &str = "Esc to go back";
 pub(super) const HOOKS_SOURCE_INLINE: &str = "User";
 pub(super) const HOOKS_SOURCE_HEADER: &str = "User Settings";
 pub(super) const HOOKS_SOURCE_LABEL: &str = "User settings";
+
+/// The same pair for a hook an integration installed in `hooks.d/`
+/// (`docs/herdr.md`) — the detail page names its file beside the label.
+pub(super) const HOOKS_INTEGRATION_HEADER: &str = "Integration";
+pub(super) const HOOKS_INTEGRATION_LABEL: &str = "Integration";
 
 /// The detail page's field-name column: `Source:` (the widest) plus its pad,
 /// so the values line up (`Event:    PreToolUse`).

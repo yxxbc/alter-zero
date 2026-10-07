@@ -182,7 +182,9 @@ fn events_lines(menu: &HooksMenu, selected: usize, width: u16) -> Vec<Line<'stat
         ),
         Line::default(),
     ];
-    if !menu.enabled && menu.overview.total() > 0 {
+    // Only the user's own layer is ever off: an integration's hooks run in
+    // every directory (`docs/herdr.md`).
+    if !menu.enabled && menu.overview.user_total() > 0 {
         // Wrapped, not clipped: the note's tail ("enable them in /settings")
         // is the actionable half, and a narrow terminal used to cut it
         // silently.
@@ -321,7 +323,12 @@ fn hook_list_lines(
             MenuRow {
                 label: vec![label_span(text, i == selected)],
                 label_cols,
-                desc: HOOKS_SOURCE_HEADER.to_string(),
+                desc: if hook.origin.is_some() {
+                    HOOKS_INTEGRATION_HEADER
+                } else {
+                    HOOKS_SOURCE_HEADER
+                }
+                .to_string(),
             }
         })
         .collect();
@@ -384,10 +391,14 @@ fn detail_lines(
         lines.push(field_line("Matcher:", label, value, width));
     }
     lines.push(field_line("Type:", &hook.kind, value, width));
-    let source = menu.source.as_ref().map_or_else(
-        || HOOKS_SOURCE_LABEL.to_string(),
-        |path| format!("{HOOKS_SOURCE_LABEL} ({path})"),
-    );
+    let source = match &hook.origin {
+        // An integration's hook names its own `hooks.d/` file.
+        Some(path) => format!("{HOOKS_INTEGRATION_LABEL} ({path})"),
+        None => menu.source.as_ref().map_or_else(
+            || HOOKS_SOURCE_LABEL.to_string(),
+            |path| format!("{HOOKS_SOURCE_LABEL} ({path})"),
+        ),
+    };
     lines.push(field_line("Source:", &source, dim, width));
     lines.push(Line::default());
     lines.push(dim_line("Command:", width));

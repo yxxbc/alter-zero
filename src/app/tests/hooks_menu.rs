@@ -5,8 +5,8 @@ use super::*;
 use crate::hooks::{HookEvent, HooksFile, HooksOverview};
 
 /// PreToolUse with two matcher rows (`bash` holding two handlers, a
-/// match-everything group holding one) and Stop with one handler — enough to
-/// walk every level and both descent shapes.
+/// match-everything group holding one) and UserPromptSubmit with one handler
+/// — enough to walk every level and both descent shapes.
 const SAMPLE: &str = r#"{
   "hooks": {
     "PreToolUse": [
@@ -17,7 +17,7 @@ const SAMPLE: &str = r#"{
         ] },
       { "hooks": [ { "type": "command", "command": "./always.sh" } ] }
     ],
-    "Stop": [
+    "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "./done.sh" } ] }
     ]
   }
@@ -43,12 +43,13 @@ fn level(app: &App) -> HooksLevel {
     app.hooks_menu.as_ref().expect("the menu is open").level
 }
 
-/// The index of Stop in the events list — a matcher-less event with a hook.
-const STOP: usize = 6;
+/// The index of UserPromptSubmit in the events list — a matcher-less event
+/// with a hook, within reach of a digit key.
+const PROMPT: usize = 6;
 
 #[test]
-fn stop_is_where_this_suite_thinks_it_is() {
-    assert_eq!(HookEvent::ALL[STOP], HookEvent::Stop);
+fn the_matcherless_event_is_where_this_suite_thinks_it_is() {
+    assert_eq!(HookEvent::ALL[PROMPT], HookEvent::UserPromptSubmit);
 }
 
 #[test]
@@ -173,16 +174,16 @@ fn a_matcherless_event_skips_the_matcher_level_both_ways() {
     assert_eq!(
         level(&app),
         HooksLevel::Hooks {
-            event: STOP,
+            event: PROMPT,
             matcher: None,
             selected: 0
         },
-        "Stop matches on nothing — no matcher level to show"
+        "UserPromptSubmit matches on nothing — no matcher level to show"
     );
     app.on_key(key(KeyCode::Esc));
     assert_eq!(
         level(&app),
-        HooksLevel::Events { selected: STOP },
+        HooksLevel::Events { selected: PROMPT },
         "Esc returns to the event row it came from"
     );
     // Its detail page carries the matcher-less path.
@@ -191,7 +192,7 @@ fn a_matcherless_event_skips_the_matcher_level_both_ways() {
     assert_eq!(
         level(&app),
         HooksLevel::Detail {
-            event: STOP,
+            event: PROMPT,
             matcher: None,
             hook: 0
         }
@@ -223,12 +224,12 @@ fn an_event_with_nothing_configured_still_descends_to_its_empty_state() {
 #[test]
 fn a_digit_past_the_rows_is_ignored() {
     let mut app = hooks_app();
-    app.on_key(key(KeyCode::Char('7'))); // Stop → its one-hook list.
+    app.on_key(key(KeyCode::Char('7'))); // UserPromptSubmit → its one-hook list.
     app.on_key(key(KeyCode::Char('5')));
     assert_eq!(
         level(&app),
         HooksLevel::Hooks {
-            event: STOP,
+            event: PROMPT,
             matcher: None,
             selected: 0
         },

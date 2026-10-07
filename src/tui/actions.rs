@@ -373,6 +373,21 @@ impl Session<'_> {
         // instead), so nothing here touches the alternate screen.
         let interrupted = self.app.interrupt_turn();
         self.finish_turn_agent_settle(owed, width);
+        // `Interrupt` (docs/hooks.md): the user stopped an agent turn — not a
+        // `!` command, which never told the hooks it started (its interrupt
+        // keeps no notice). Fired before the queue below can start the next
+        // turn, onto the lane every later hook waits behind, so a session
+        // tracker hears *idle* before that turn's *working* (docs/herdr.md).
+        if matches!(
+            interrupted,
+            Some(alter_zero::app::InterruptedTurn::Undone)
+                | Some(alter_zero::app::InterruptedTurn::Kept {
+                    notice: Some(_),
+                    ..
+                })
+        ) {
+            self.models.fire_interrupt();
+        }
         match interrupted {
             Some(alter_zero::app::InterruptedTurn::Undone) => {
                 // Nothing had streamed and nothing was queued: the submission is
@@ -467,17 +482,18 @@ impl Session<'_> {
         // shared registry follows so the model's next `tasklist` agrees
         // (docs/task-tools.md).
         self.sync_task_registry();
+        // The session boundary for the hooks (docs/hooks.md), Claude Code's
+        // pair for its /clear: SessionEnd(clear) names the conversation being
+        // cleared, so it fires before the recorder moves on —
+        self.models.end_conversation("clear");
         // A cleared conversation starts a fresh session file (codex's /new); the
         // old one keeps what it had (docs/resume.md). Re-seed the checkpoint chain
         // with a pristine snapshot of the current tree so a backtrack in the new
         // session can restore its starting point (docs/checkpoint.md).
         self.recorder.start_new();
-        // The session boundary for the hooks: SessionEnd(clear) fires now —
-        // bounded, so /clear cannot hang — and SessionStart(clear) at the
-        // next turn's top, the codex drain (docs/hooks.md). Claude Code
-        // fires the same pair for its /clear.
-        self.models.fire_session_end("clear");
-        self.models.queue_session_source("clear");
+        // — and SessionStart(clear) the new one, fired in the background on
+        // the hooks' lane behind it. Neither blocks the loop.
+        self.models.begin_conversation("clear");
         if let Some(commit) = self.checkpoints.snapshot("session start") {
             self.recorder
                 .record_checkpoint(checkpoint::Checkpoint { after: 0, commit });

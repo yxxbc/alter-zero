@@ -766,10 +766,18 @@ impl ModelSession {
     /// re-attaches, so the browser and the dispatcher can never disagree; a
     /// session with no runnable hooks browses as empty (the `/settings`
     /// row's own posture).
-    pub(crate) fn hooks_browse(&self) -> (alter_zero::hooks::HooksOverview, bool) {
+    pub(crate) fn hooks_browse(
+        &self,
+        display: impl Fn(&std::path::Path) -> String,
+    ) -> (alter_zero::hooks::HooksOverview, bool) {
         match &self.hooks {
+            // The user's layer, then each integration under its own file
+            // (`docs/herdr.md`) — the order the dispatcher runs them in.
             Some(setup) => (
-                alter_zero::hooks::HooksOverview::from_file(&setup.file),
+                setup.integrations.iter().fold(
+                    alter_zero::hooks::HooksOverview::from_file(&setup.file),
+                    |overview, (path, file)| overview.with_integration(file, &display(path)),
+                ),
                 setup.enabled,
             ),
             None => (
@@ -781,9 +789,11 @@ impl ModelSession {
         }
     }
 
-    /// Queue a `SessionStart` source (`startup` / `resume` / `clear`) for the
-    /// next turn's drain (`docs/hooks.md`). A no-op without hooks.
-    pub(crate) fn queue_session_source(&self, source: &str) {
+    /// Queue a `SessionStart` source (`startup` / `resume` / `clear`) — fired
+    /// by the next [`fire_session_start`](Self::fire_session_start), or the
+    /// next turn's drain when the session had no real backend to fire it on
+    /// (`docs/hooks.md`). A no-op without hooks.
+    fn queue_session_source(&self, source: &str) {
         if let Some(setup) = &self.hooks
             && let Ok(mut sources) = setup.handles.sources.lock()
         {
@@ -791,17 +801,65 @@ impl ModelSession {
         }
     }
 
-    /// Fire the `SessionEnd` hooks (`docs/hooks.md`) — a `/clear`'s `clear`,
-    /// a quit's `prompt_input_exit`. Bounded inside the sink (2 s for the
-    /// whole event), so neither path can hang on a hook. A no-op without
-    /// hooks.
-    pub(crate) fn fire_session_end(&self, reason: &str) {
-        if let Some(sink) = self
-            .hooks
+    /// The sink the **boundary's** events fire on (`docs/hooks.md`): `None`
+    /// without a real backend — the offline demo fires no hooks, so it fires
+    /// no boundary events either, and a `SessionEnd` never precedes the
+    /// `SessionStart` it would close — or without hooks to run.
+    fn boundary_hooks(&self) -> Option<alter_zero::llm::hooks::CommandHooks> {
+        if !self.real_backend {
+            return None;
+        }
+        self.hooks
             .as_ref()
-            .and_then(|setup| setup.sink(&self.model_name()))
-        {
-            sink.session_end(reason);
+            .and_then(|setup| setup.command_hooks(&self.model_name()))
+    }
+
+    /// Fire the queued `SessionStart` sources now, in the background on the
+    /// hooks' lane — Claude Code's timing, so a session tracker hears of the
+    /// session at launch rather than at its first prompt (`docs/herdr.md`).
+    /// Their context waits for the next turn. Without a real backend the
+    /// sources stay queued for the first turn that has one.
+    pub(crate) fn fire_session_start(&self) {
+        if let Some(hooks) = self.boundary_hooks() {
+            hooks.fire_session_start();
+        }
+    }
+
+    /// The user interrupted the running turn: `Interrupt`, on the lane — the
+    /// loop never waits on it, and the next turn's hooks never overtake it.
+    pub(crate) fn fire_interrupt(&self) {
+        if let Some(hooks) = self.boundary_hooks() {
+            hooks.fire_interrupt();
+        }
+    }
+
+    /// The conversation is being replaced in this process (`/clear`,
+    /// `/resume`): `SessionEnd` with `reason`, naming the conversation that
+    /// ends — so call it **before** the recorder moves on — and any
+    /// `SessionStart` context it never got to read forgotten. Never blocks.
+    pub(crate) fn end_conversation(&self, reason: &str) {
+        if let Some(setup) = &self.hooks {
+            setup.handles.forget_held_contexts();
+        }
+        if let Some(hooks) = self.boundary_hooks() {
+            hooks.fire_session_end(reason);
+        }
+    }
+
+    /// The conversation that replaced it began: `SessionStart` with `source`,
+    /// in the background — call it **after** the recorder moved on, so the
+    /// event names the new conversation.
+    pub(crate) fn begin_conversation(&self, source: &str) {
+        self.queue_session_source(source);
+        self.fire_session_start();
+    }
+
+    /// The session is quitting: `SessionEnd` (`prompt_input_exit`), waited
+    /// for under its bounded budget — whatever the lane still held is
+    /// dropped first, so a quit never hangs on a hook (`docs/hooks.md`).
+    pub(crate) fn end_session_at_exit(&self) {
+        if let Some(hooks) = self.boundary_hooks() {
+            hooks.end_session_at_exit("prompt_input_exit");
         }
     }
 
@@ -966,6 +1024,10 @@ impl ModelSession {
         // …and this session's own, which its rollout records
         // (docs/session-model.md).
         self.session_selection = Some(selection);
+        // A session that ran the offline demo until now — a `/login` — has
+        // its `startup` still queued: it fires now, on the backend that
+        // makes it real (docs/hooks.md). A no-op for a session already real.
+        self.fire_session_start();
         true
     }
 
@@ -1257,27 +1319,14 @@ impl ModelSession {
                 // the summary — via the wrapper, so the ordinary session
                 // events (UserPromptSubmit, Stop, the source drain) can never
                 // fire for a summarization turn.
-                if let Some(setup) = self.hooks.as_ref().filter(|setup| setup.enabled) {
-                    let context = alter_zero::hooks::HookContext {
-                        session_id: setup.session_id.clone(),
-                        transcript_path: None,
-                        cwd: setup.cwd.display().to_string(),
-                        model,
-                        permission_mode: None,
-                        agent_id: None,
-                        agent_type: None,
-                    };
-                    if let Some(inner) = alter_zero::llm::hooks::CommandHooks::new(
-                        std::sync::Arc::clone(&setup.file),
-                        context,
-                        setup.detach_helper.clone(),
-                        setup.cwd.clone(),
-                        setup.handles.clone(),
-                    ) {
-                        backend = backend.with_hooks(std::sync::Arc::new(
-                            alter_zero::llm::hooks::CompactHooks::new(inner, auto),
-                        ));
-                    }
+                if let Some(inner) = self
+                    .hooks
+                    .as_ref()
+                    .and_then(|setup| setup.command_hooks(&model))
+                {
+                    backend = backend.with_hooks(std::sync::Arc::new(
+                        alter_zero::llm::hooks::CompactHooks::new(inner, auto),
+                    ));
                 }
                 backend
             })
@@ -1392,7 +1441,9 @@ pub(crate) struct ModelRestore {
 pub(crate) struct HookSetup {
     /// The parsed `hooks.json`.
     pub(crate) file: std::sync::Arc<alter_zero::hooks::HooksFile>,
-    /// This run's id, the payload's `session_id`.
+    /// The session's startup id — the payload's `session_id` until the
+    /// recorder publishes the conversation's (which is this same id for a
+    /// fresh session's first conversation, `docs/hooks.md`).
     pub(crate) session_id: String,
     /// Where handlers run, and what `*_PROJECT_DIR` points at.
     pub(crate) cwd: std::path::PathBuf,
@@ -1403,19 +1454,45 @@ pub(crate) struct HookSetup {
     /// off mid-session genuinely stops running them.
     pub(crate) enabled: bool,
     /// The live handles — the gate (a Ctrl+T cycle reaches the very next
-    /// payload), the rollout path the recorder publishes, the queued
+    /// payload), the conversation the recorder publishes, the queued
     /// SessionStart sources, and the synthetic-turn mark — shared into every
     /// sink built, surviving each rebuild (`docs/hooks.md`).
     pub(crate) handles: alter_zero::llm::hooks::HookHandles,
+    /// The session's scratchpad, for the payloads' `scratchpad_dir` — `None`
+    /// when the session has none (`docs/scratchpad.md`).
+    pub(crate) scratchpad_dir: Option<std::path::PathBuf>,
+    /// The integration layer (`docs/herdr.md`): each `hooks.d/*.json` with
+    /// its path — listed by `/hooks` under its own file — and their union,
+    /// which runs in every directory, whatever [`enabled`](Self::enabled)
+    /// says.
+    pub(crate) integrations: Vec<(std::path::PathBuf, alter_zero::hooks::HooksFile)>,
+    pub(crate) integrations_merged: std::sync::Arc<alter_zero::hooks::HooksFile>,
 }
 
 impl HookSetup {
     /// The sink for a backend answering as `model`, or `None` when hooks are
     /// switched off (or the file had nothing runnable).
     fn sink(&self, model: &str) -> Option<std::sync::Arc<dyn alter_zero::llm::hooks::HookSink>> {
-        if !self.enabled {
-            return None;
-        }
+        self.command_hooks(model).map(|hooks| {
+            std::sync::Arc::new(hooks) as std::sync::Arc<dyn alter_zero::llm::hooks::HookSink>
+        })
+    }
+
+    /// The concrete sink [`sink`](Self::sink) wraps — what the compact turn
+    /// wraps in its own `CompactHooks` instead (`docs/hooks.md`) — so the two
+    /// can never build different payloads or run different files.
+    pub(crate) fn command_hooks(
+        &self,
+        model: &str,
+    ) -> Option<alter_zero::llm::hooks::CommandHooks> {
+        // The user's file (with the trusted project's) runs where the row is
+        // on; the integrations run everywhere (`docs/herdr.md`), after it.
+        let file = match (self.enabled, self.integrations_merged.is_empty()) {
+            (true, true) => std::sync::Arc::clone(&self.file),
+            (true, false) => std::sync::Arc::new(self.file.merged(&self.integrations_merged)),
+            (false, false) => std::sync::Arc::clone(&self.integrations_merged),
+            (false, true) => return None,
+        };
         let context = alter_zero::hooks::HookContext {
             session_id: self.session_id.clone(),
             // Resolved live per payload from the shared cell / the gate —
@@ -1426,17 +1503,18 @@ impl HookSetup {
             permission_mode: None,
             agent_id: None,
             agent_type: None,
+            scratchpad_dir: self
+                .scratchpad_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
         };
         alter_zero::llm::hooks::CommandHooks::new(
-            std::sync::Arc::clone(&self.file),
+            file,
             context,
             self.detach_helper.clone(),
             self.cwd.clone(),
             self.handles.clone(),
         )
-        .map(|hooks| {
-            std::sync::Arc::new(hooks) as std::sync::Arc<dyn alter_zero::llm::hooks::HookSink>
-        })
     }
 }
 

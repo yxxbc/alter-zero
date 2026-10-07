@@ -91,6 +91,7 @@ pub(crate) mod export;
 pub(crate) mod git_diff_loader;
 pub(crate) mod history_store;
 pub(crate) mod host;
+pub(crate) mod integration_cli;
 pub(crate) mod login;
 pub(crate) mod mascot;
 pub(crate) mod mcp;

@@ -10,7 +10,7 @@
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::hooks::{HookPermissionVerdict, HookSink};
+use super::hooks::{HookPermissionVerdict, HookSink, PermissionSource};
 use super::tools::{
     self, BashArgs, EditArgs, SessionArgs, ToolCallRequest, WriteArgs, render_numbered_content,
     render_numbered_diff,
@@ -267,9 +267,18 @@ pub fn approve_call(
     // classifier does — after the standing rules, before the user — because it
     // answers the same question: *may this run without asking?* A hook that
     // abstains falls through to the classifier and then the prompt, unchanged.
+    //
+    // From here on every decision is announced as `PermissionResult`, whoever
+    // makes it — the pairing a status tracker reads a request against
+    // (`docs/hooks.md`, `docs/herdr.md`); a cancel announces nothing, the
+    // `Interrupt` that follows being the record.
     match hooks.permission_request(call, cancel) {
-        Some(HookPermissionVerdict::Allow { note }) => return Approval::AllowNoted { note },
+        Some(HookPermissionVerdict::Allow { note }) => {
+            hooks.permission_result(call, true, PermissionSource::Hook, cancel);
+            return Approval::AllowNoted { note };
+        }
         Some(HookPermissionVerdict::Deny { display, result }) => {
+            hooks.permission_result(call, false, PermissionSource::Hook, cancel);
             return Approval::Reject { display, result };
         }
         None => {}
@@ -290,11 +299,13 @@ pub fn approve_call(
     {
         match classify(&request) {
             Ok(ClassifierVerdict { allow: true, .. }) => {
+                hooks.permission_result(call, true, PermissionSource::Classifier, cancel);
                 return Approval::AllowNoted {
                     note: CLASSIFIER_ALLOWED_NOTE.to_string(),
                 };
             }
             Ok(ClassifierVerdict { reason, .. }) => {
+                hooks.permission_result(call, false, PermissionSource::Classifier, cancel);
                 let reason = Some(reason.trim()).filter(|r| !r.is_empty());
                 return Approval::Reject {
                     display: classifier_denied_display(reason),
@@ -317,7 +328,21 @@ pub fn approve_call(
     }
     request.id = gate.next_id();
     let _ = tx.send(StreamEvent::Permission(request.clone()));
-    match gate.wait(&request.id, &|| cancel.is_cancelled()) {
+    // The prompt is on screen: `Notification(permission_prompt)`, the
+    // moment a human is actually being asked — which `PermissionRequest`,
+    // fired before the classifier, cannot say. The command sink queues it
+    // on the hooks' lane, so the wait begins at once, and the `Interrupt` of
+    // an Esc on this prompt can never reach a hook before it (`docs/hooks.md`).
+    hooks.permission_prompt(call, cancel);
+    let decision = gate.wait(&request.id, &|| cancel.is_cancelled());
+    if let Some(decision) = &decision {
+        let allowed = matches!(
+            decision,
+            PermissionDecision::Approve | PermissionDecision::ApproveAlways
+        );
+        hooks.permission_result(call, allowed, PermissionSource::User, cancel);
+    }
+    match decision {
         Some(PermissionDecision::Approve) => Approval::Allow,
         Some(PermissionDecision::ApproveAlways) => {
             gate.remember(&request);
@@ -346,7 +371,7 @@ pub fn approve_call(
 
 #[cfg(test)]
 mod tests {
-    use super::super::hooks::NoHooks;
+    use super::super::hooks::{NoHooks, PermissionSource};
     use super::*;
 
     fn call(name: &str, args: &str) -> ToolCallRequest {
@@ -821,6 +846,230 @@ mod tests {
             "typed commands meet the classifier like run ones: {approval:?}"
         );
         assert!(rx.try_recv().is_err(), "the user was never asked");
+    }
+
+    // ===== the hooks a prompt announces itself to (docs/hooks.md) =====
+
+    /// A sink that logs the permission events in the order they fire, and
+    /// answers `PermissionRequest` from a fixture.
+    #[derive(Debug, Default)]
+    struct PromptHooks {
+        request: Option<HookPermissionVerdict>,
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PromptHooks {
+        fn log(&self) -> Vec<String> {
+            self.log.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl HookSink for PromptHooks {
+        fn permission_request(
+            &self,
+            call: &ToolCallRequest,
+            _cancel: &CancelToken,
+        ) -> Option<HookPermissionVerdict> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("request {}", call.id));
+            self.request.clone()
+        }
+
+        fn permission_prompt(&self, call: &ToolCallRequest, _cancel: &CancelToken) {
+            self.log.lock().unwrap().push(format!("prompt {}", call.id));
+        }
+
+        fn permission_result(
+            &self,
+            call: &ToolCallRequest,
+            allowed: bool,
+            source: PermissionSource,
+            _cancel: &CancelToken,
+        ) {
+            let behavior = if allowed { "allow" } else { "deny" };
+            self.log.lock().unwrap().push(format!(
+                "result {} {behavior} {}",
+                call.id,
+                source.label()
+            ));
+        }
+    }
+
+    /// Put `call` to `gate` on a thread with `hooks`, answer the prompt (when
+    /// one is raised) with `decision`, and hand back the approval and whether
+    /// a prompt was raised.
+    fn decide_with_hooks(
+        gate: &PermissionGate,
+        hooks: std::sync::Arc<PromptHooks>,
+        classify: Option<std::sync::Arc<ClassifierFn>>,
+        decision: Option<PermissionDecision>,
+    ) -> (Approval, bool) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancelToken::new();
+        let waiter = {
+            let (gate, tx, cancel, hooks) = (gate.clone(), tx.clone(), cancel.clone(), hooks);
+            std::thread::spawn(move || {
+                let classify = classify.as_ref().map(|f| {
+                    let f = std::sync::Arc::clone(f);
+                    move |request: &PermissionRequest| f(request)
+                });
+                approve_call(
+                    Some(&gate),
+                    classify.as_ref().map(|f| f as &ClassifyCommand<'_>),
+                    None,
+                    hooks.as_ref(),
+                    false,
+                    &tx,
+                    &cancel,
+                    None,
+                    &ToolCallRequest {
+                        id: "call-1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: r#"{"command":"make deploy"}"#.to_string(),
+                    },
+                    None,
+                )
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut prompted = false;
+        loop {
+            if let Ok(StreamEvent::Permission(request)) = rx.try_recv() {
+                prompted = true;
+                match &decision {
+                    Some(decision) => gate.resolve(&request.id, decision.clone()),
+                    None => cancel.cancel(),
+                }
+            }
+            if waiter.is_finished() {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the approval never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (waiter.join().unwrap(), prompted)
+    }
+
+    type ClassifierFn =
+        dyn Fn(&PermissionRequest) -> Result<ClassifierVerdict, String> + Send + Sync;
+
+    #[test]
+    fn a_prompt_announces_itself_and_its_answer_to_the_hooks() {
+        // `Notification(permission_prompt)` the moment the prompt is on
+        // screen, `PermissionResult` once it is answered — the pair a status
+        // tracker reads as *blocked* and back (docs/herdr.md).
+        let gate = PermissionGate::new();
+        let hooks = std::sync::Arc::new(PromptHooks::default());
+        let (approval, prompted) = decide_with_hooks(
+            &gate,
+            std::sync::Arc::clone(&hooks),
+            None,
+            Some(PermissionDecision::Approve),
+        );
+        assert!(prompted);
+        assert_eq!(approval, Approval::Allow);
+        assert_eq!(
+            hooks.log(),
+            vec![
+                "request call-1",
+                "prompt call-1",
+                "result call-1 allow user"
+            ]
+        );
+
+        let hooks = std::sync::Arc::new(PromptHooks::default());
+        let (approval, _) = decide_with_hooks(
+            &gate,
+            std::sync::Arc::clone(&hooks),
+            None,
+            Some(PermissionDecision::Deny(None)),
+        );
+        assert!(matches!(approval, Approval::Reject { .. }));
+        assert_eq!(
+            hooks.log(),
+            vec!["request call-1", "prompt call-1", "result call-1 deny user"]
+        );
+    }
+
+    #[test]
+    fn a_request_a_hook_decides_still_reports_its_result_and_never_prompts() {
+        // The pairing a tracker relies on: every PermissionRequest that is
+        // decided is followed by its PermissionResult, whoever decided — and
+        // no `permission_prompt`, because nobody was shown one.
+        let gate = PermissionGate::new();
+        for (verdict, expected) in [
+            (
+                HookPermissionVerdict::Allow {
+                    note: "Allowed by hook".to_string(),
+                },
+                "result call-1 allow hook",
+            ),
+            (
+                HookPermissionVerdict::Deny {
+                    display: "no".to_string(),
+                    result: "no".to_string(),
+                },
+                "result call-1 deny hook",
+            ),
+        ] {
+            let hooks = std::sync::Arc::new(PromptHooks {
+                request: Some(verdict),
+                ..PromptHooks::default()
+            });
+            let (_, prompted) = decide_with_hooks(&gate, std::sync::Arc::clone(&hooks), None, None);
+            assert!(!prompted);
+            assert_eq!(hooks.log(), vec!["request call-1", expected]);
+        }
+    }
+
+    #[test]
+    fn a_request_the_classifier_decides_reports_its_result_and_never_prompts() {
+        let gate = gate_in(crate::permission::PermissionMode::Auto);
+        for (allow, expected) in [
+            (true, "result call-1 allow classifier"),
+            (false, "result call-1 deny classifier"),
+        ] {
+            let hooks = std::sync::Arc::new(PromptHooks::default());
+            let classify: std::sync::Arc<ClassifierFn> =
+                std::sync::Arc::new(move |_: &PermissionRequest| {
+                    Ok(ClassifierVerdict {
+                        allow,
+                        reason: "reviewed".to_string(),
+                    })
+                });
+            let (_, prompted) =
+                decide_with_hooks(&gate, std::sync::Arc::clone(&hooks), Some(classify), None);
+            assert!(!prompted, "auto mode's verdict asks nobody");
+            assert_eq!(hooks.log(), vec!["request call-1", expected]);
+        }
+    }
+
+    #[test]
+    fn a_call_a_standing_rule_covers_fires_no_permission_events() {
+        let gate = PermissionGate::new();
+        gate.set_mode(crate::permission::PermissionMode::Master);
+        let hooks = std::sync::Arc::new(PromptHooks::default());
+        let (approval, prompted) =
+            decide_with_hooks(&gate, std::sync::Arc::clone(&hooks), None, None);
+        assert_eq!(approval, Approval::Allow);
+        assert!(!prompted);
+        assert_eq!(hooks.log(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_prompt_reaped_by_a_cancel_reports_no_result() {
+        // Esc tore the turn down: the Interrupt that follows is the record,
+        // and a hook run now would be killed by the cancelled token anyway.
+        let gate = PermissionGate::new();
+        let hooks = std::sync::Arc::new(PromptHooks::default());
+        let (_, prompted) = decide_with_hooks(&gate, std::sync::Arc::clone(&hooks), None, None);
+        assert!(prompted);
+        assert_eq!(hooks.log(), vec!["request call-1", "prompt call-1"]);
     }
 
     // ===== the auto mode classifier (docs/permissions.md) =====

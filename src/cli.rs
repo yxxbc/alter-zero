@@ -19,6 +19,10 @@
 //! detached-exec hook (invariant 1: a helper re-exec never parses TUI
 //! flags).
 //!
+//! A first argument of `integration` routes to its own family
+//! (`docs/herdr.md`): `install`/`uninstall`/`status` an integration's
+//! `hooks.d/` file, and `hook`, which is what those hooks run.
+//!
 //! A first argument of `mcp` routes to the subcommand family instead
 //! (`docs/mcp-cli.md`): `mcp add`/`add-json`/`remove`/`get`/`list` manage
 //! the **user** MCP config file (`docs/mcp.md`) from a script, answered at
@@ -50,6 +54,56 @@ pub enum Cli {
     /// `update` as the first argument: install the newest release over this
     /// binary when one is out (`docs/update.md`). Takes nothing.
     Update,
+    /// `integration …` as the first argument: install, remove or report on
+    /// an integration with another tool (`docs/herdr.md`).
+    Integration(IntegrationCli),
+}
+
+/// One parsed `integration` subcommand (`docs/herdr.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrationCli {
+    /// `integration install <name>`: write its `hooks.d/` file.
+    Install(Integration),
+    /// `integration uninstall <name>`: remove it.
+    Uninstall(Integration),
+    /// `integration status`: what is installed, and whether this terminal
+    /// is inside what it integrates with.
+    Status,
+    /// `integration hook <name>`: what the installed hooks run — one hook
+    /// payload on stdin, reported. Never a usage error, whatever follows: it
+    /// runs **as** a lifecycle hook, where exit 2 is a block (a `Stop` hook
+    /// would force the turn on), so the name is kept verbatim and the
+    /// boundary ignores one it does not know.
+    Hook(String),
+    /// `-h`/`--help` anywhere, or `integration` alone: print the
+    /// [`HelpPage::Integration`] page and exit 0.
+    Help,
+}
+
+/// An integration this binary can install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integration {
+    /// [herdr](https://herdr.dev), the terminal multiplexer for coding agents.
+    Herdr,
+}
+
+impl Integration {
+    /// Every integration, for the error that lists them.
+    pub const ALL: &'static [Self] = &[Self::Herdr];
+
+    /// The command-line name — also the `hooks.d/{name}.json` file's.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Herdr => "herdr",
+        }
+    }
+
+    /// The integration `name` names.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|i| i.name() == name)
+    }
 }
 
 /// A TUI run's arguments (`docs/cli.md`): which conversation to open, and
@@ -123,6 +177,8 @@ pub enum HelpPage {
     Main,
     /// `alter-zero mcp --help`.
     Mcp,
+    /// `alter-zero integration --help`.
+    Integration,
 }
 
 /// How a page is dressed. `Plain` emits no escape sequence at all — what a
@@ -211,6 +267,7 @@ const MAIN_DOC: HelpDoc = HelpDoc {
     usage: &[
         ("alter-zero", " [OPTIONS] [PROMPT]"),
         ("alter-zero mcp", " <COMMAND>"),
+        ("alter-zero integration", " <COMMAND>"),
         ("alter-zero update", ""),
     ],
     sections: &[
@@ -222,6 +279,12 @@ const MAIN_DOC: HelpDoc = HelpDoc {
                     placeholder: "",
                     description: "Manage MCP servers in the user config file — see\n\
                                   alter-zero mcp --help",
+                },
+                Row {
+                    literal: "integration",
+                    placeholder: "",
+                    description: "Connect another tool, such as the herdr multiplexer — see\n\
+                                  alter-zero integration --help",
                 },
                 Row {
                     literal: "update",
@@ -318,11 +381,45 @@ Manage MCP servers in the user config file (ALTER_ZERO_MCP_FILE, else
     }],
 };
 
+const INTEGRATION_DOC: HelpDoc = HelpDoc {
+    title: "alter-zero integration",
+    description: "\
+Connect Alter Zero to another tool. An integration is a hooks file in
+~/.alter-zero/hooks.d/ — its hooks run in every directory, beside your own
+hooks.json — that installing writes and uninstalling removes.",
+    usage: &[
+        ("alter-zero integration install", " <NAME>"),
+        ("alter-zero integration uninstall", " <NAME>"),
+        ("alter-zero integration status", ""),
+    ],
+    sections: &[
+        Section {
+            heading: "Integrations:",
+            rows: &[Row {
+                literal: "herdr",
+                placeholder: "",
+                description: "Show working, blocked and idle in the herdr pane the\n\
+                              agent runs in, and bring the conversation back after a\n\
+                              herdr restart",
+            }],
+        },
+        Section {
+            heading: "Options:",
+            rows: &[Row {
+                literal: "-h, --help",
+                placeholder: "",
+                description: "Print help",
+            }],
+        },
+    ],
+};
+
 impl HelpPage {
     const fn doc(self) -> &'static HelpDoc {
         match self {
             Self::Main => &MAIN_DOC,
             Self::Mcp => &MCP_DOC,
+            Self::Integration => &INTEGRATION_DOC,
         }
     }
 }
@@ -440,6 +537,11 @@ where
         args.next();
         return parse_mcp(args).map(Cli::Mcp);
     }
+    // `integration` likewise (docs/herdr.md).
+    if args.peek().is_some_and(|first| first == "integration") {
+        args.next();
+        return parse_integration(args.collect()).map(Cli::Integration);
+    }
     // `update` routes the same way (docs/update.md), and takes nothing: a
     // flag or a word after it is a mistake to report, not a prompt to run.
     if args.peek().is_some_and(|first| first == "update") {
@@ -506,6 +608,53 @@ where
         );
     }
     Ok(Cli::Session(SessionArgs { start, prompt }))
+}
+
+/// The `integration` grammar (`docs/herdr.md`), its arguments after the
+/// word itself.
+fn parse_integration(rest: Vec<String>) -> Result<IntegrationCli, String> {
+    // `hook` first, and leniently: it runs as a lifecycle hook, where a
+    // usage error's exit 2 is a block.
+    if rest.first().map(String::as_str) == Some("hook") {
+        return Ok(IntegrationCli::Hook(
+            rest.get(1).cloned().unwrap_or_default(),
+        ));
+    }
+    if rest.is_empty() || rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return Ok(IntegrationCli::Help);
+    }
+    let known = || {
+        Integration::ALL
+            .iter()
+            .map(|i| i.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let command = rest[0].as_str();
+    match command {
+        "install" | "uninstall" => {
+            let name = rest.get(1).ok_or_else(|| {
+                format!("{command} needs an integration name (known: {})", known())
+            })?;
+            if let Some(extra) = rest.get(2) {
+                return Err(format!("unexpected argument '{extra}'"));
+            }
+            let integration = Integration::from_name(name)
+                .ok_or_else(|| format!("unknown integration '{name}' (known: {})", known()))?;
+            Ok(if command == "install" {
+                IntegrationCli::Install(integration)
+            } else {
+                IntegrationCli::Uninstall(integration)
+            })
+        }
+        "status" => match rest.get(1) {
+            Some(extra) => Err(format!("unexpected argument '{extra}'")),
+            None => Ok(IntegrationCli::Status),
+        },
+        other => Err(format!(
+            "unknown integration command '{other}' (install, uninstall, status)"
+        )),
+    }
 }
 
 /// A flag is a dash plus something; a lone `-` is a positional.
@@ -1025,11 +1174,14 @@ Starts an interactive session by default — a quoted PROMPT is its first turn.
 
 Usage: alter-zero [OPTIONS] [PROMPT]
        alter-zero mcp <COMMAND>
+       alter-zero integration <COMMAND>
        alter-zero update
 
 Commands:
   mcp                 Manage MCP servers in the user config file — see
                       alter-zero mcp --help
+  integration         Connect another tool, such as the herdr multiplexer — see
+                      alter-zero integration --help
   update              Install the newest release over this binary, if one is
                       out — the one-line installer, checksum-verified
 
@@ -1169,7 +1321,8 @@ Options:
         assert_eq!(
             text,
             "error: unrecognized argument: --frob\n\n\
-             Usage: alter-zero [OPTIONS] [PROMPT]\n       alter-zero mcp <COMMAND>\n       alter-zero update\n\n\
+             Usage: alter-zero [OPTIONS] [PROMPT]\n       alter-zero mcp <COMMAND>\n       \
+             alter-zero integration <COMMAND>\n       alter-zero update\n\n\
              For more information, try '--help'."
         );
         let styled = usage_error(HelpPage::Main, "x", HelpStyle::Ansi);
@@ -1220,6 +1373,109 @@ Options:
             parsed(&["-c", "update"]),
             Ok(Cli::Session(SessionArgs { prompt: Some(p), .. })) if p == "update"
         ));
+    }
+
+    // ===== the integration subcommand (docs/herdr.md) =====
+
+    #[test]
+    fn integration_installs_removes_and_reports_by_name() {
+        assert_eq!(
+            parsed(&["integration", "install", "herdr"]),
+            Ok(Cli::Integration(IntegrationCli::Install(
+                Integration::Herdr
+            )))
+        );
+        assert_eq!(
+            parsed(&["integration", "uninstall", "herdr"]),
+            Ok(Cli::Integration(IntegrationCli::Uninstall(
+                Integration::Herdr
+            )))
+        );
+        assert_eq!(
+            parsed(&["integration", "status"]),
+            Ok(Cli::Integration(IntegrationCli::Status))
+        );
+        for help in [
+            &["integration"][..],
+            &["integration", "--help"],
+            &["integration", "install", "-h"],
+        ] {
+            assert_eq!(
+                parsed(help),
+                Ok(Cli::Integration(IntegrationCli::Help)),
+                "{help:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_refuses_what_it_cannot_do_by_name() {
+        let err = parsed(&["integration", "install", "tmux"]).unwrap_err();
+        assert!(
+            err.contains("unknown integration 'tmux'") && err.contains("herdr"),
+            "{err}"
+        );
+        let err = parsed(&["integration", "install"]).unwrap_err();
+        assert!(err.contains("install needs an integration"), "{err}");
+        let err = parsed(&["integration", "install", "herdr", "now"]).unwrap_err();
+        assert!(err.contains("unexpected argument 'now'"), "{err}");
+        let err = parsed(&["integration", "status", "herdr"]).unwrap_err();
+        assert!(err.contains("unexpected argument 'herdr'"), "{err}");
+        let err = parsed(&["integration", "frobnicate"]).unwrap_err();
+        assert!(
+            err.contains("unknown integration command 'frobnicate'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_hook_command_never_fails_the_hook_that_runs_it() {
+        // `integration hook <name>` runs as a lifecycle hook: a usage error's
+        // exit 2 there is a *block* — a Stop hook would force the turn on —
+        // so whatever follows `hook` parses, and the boundary ignores a name
+        // it does not know (docs/herdr.md).
+        assert_eq!(
+            parsed(&["integration", "hook", "herdr"]),
+            Ok(Cli::Integration(IntegrationCli::Hook("herdr".to_string())))
+        );
+        assert_eq!(
+            parsed(&["integration", "hook", "tmux", "--extra"]),
+            Ok(Cli::Integration(IntegrationCli::Hook("tmux".to_string())))
+        );
+        assert_eq!(
+            parsed(&["integration", "hook"]),
+            Ok(Cli::Integration(IntegrationCli::Hook(String::new())))
+        );
+    }
+
+    #[test]
+    fn integration_routes_as_the_first_argument_only() {
+        assert!(matches!(
+            parsed(&["-c", "integration"]),
+            Ok(Cli::Session(SessionArgs { prompt: Some(p), .. })) if p == "integration"
+        ));
+    }
+
+    #[test]
+    fn the_integration_page_names_its_commands_and_fits_eighty_columns() {
+        use unicode_width::UnicodeWidthStr;
+        let page = help(HelpPage::Integration, HelpStyle::Plain);
+        assert_eq!(page.lines().next(), Some("alter-zero integration"));
+        for form in [
+            "alter-zero integration install <NAME>",
+            "alter-zero integration uninstall <NAME>",
+            "alter-zero integration status",
+        ] {
+            assert!(page.contains(form), "{form} missing from:\n{page}");
+        }
+        assert!(page.contains("herdr"), "{page}");
+        // An installed binary ships no repository: a help page that points
+        // at `docs/…` points at nothing.
+        assert!(!page.contains("docs/"), "{page}");
+        for line in page.lines() {
+            assert!(line.width() <= 80, "{line:?}");
+            assert_eq!(line, line.trim_end(), "{line:?}");
+        }
     }
 
     // ===== the mcp subcommand (docs/mcp-cli.md) =====

@@ -24,8 +24,11 @@ pub struct HooksMenu {
     /// The display path of the file the `Source:` line names (`None` when no
     /// config home resolved).
     pub source: Option<String>,
-    /// Whether the session actually runs these hooks — `false` shows the
-    /// disabled note under the header (`/settings` off, `ALTER_ZERO_HOOKS=0`).
+    /// Whether the session runs the user's own layer (`hooks.json` and the
+    /// trusted project file) — `false` shows the disabled note under the
+    /// header (`/settings` off, `ALTER_ZERO_HOOKS=0`) when that layer has
+    /// hooks. An integration's hooks (`hooks.d/`, listed with their file)
+    /// run regardless (`docs/herdr.md`).
     pub enabled: bool,
     /// Where the browse stands — Claude Code's four-mode state machine.
     pub level: HooksLevel,
@@ -36,7 +39,7 @@ pub struct HooksMenu {
 /// `events[event].matchers[matcher]`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HooksLevel {
-    /// Level 1: the eleven events.
+    /// Level 1: the sixteen events.
     Events { selected: usize },
     /// Level 2: one event's matcher rows (only for an event whose dispatch
     /// matches on something — [`crate::hooks::event_has_matchers`]).

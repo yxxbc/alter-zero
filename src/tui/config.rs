@@ -408,6 +408,64 @@ pub(crate) fn load_hooks(path: Option<&Path>) -> (alter_zero::hooks::HooksFile, 
     }
 }
 
+/// The always-on integration layer's directory (`docs/herdr.md`):
+/// `{config_home}/hooks.d`, beside `hooks.json`.
+pub(crate) fn hook_integrations_dir() -> Option<PathBuf> {
+    config_home().map(|home| home.join("hooks.d"))
+}
+
+/// Load the integration layer (`docs/herdr.md`): every `*.json` in `dir`, in
+/// file-name order, each a whole `hooks.json` an installer wrote — the files
+/// whose hooks run in every directory, whatever the **Hooks** row says. A
+/// file that will not parse is reported (the message names it) and skipped,
+/// the others still load: one broken integration must not take its siblings
+/// down. A missing directory is the normal case, and no layer.
+pub(crate) fn load_hook_integrations(
+    dir: Option<&Path>,
+) -> (Vec<(PathBuf, alter_zero::hooks::HooksFile)>, Vec<String>) {
+    let mut layers = Vec::new();
+    let mut errors = Vec::new();
+    let Some(dir) = dir else {
+        return (layers, errors);
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return (layers, errors),
+        Err(err) => {
+            errors.push(format!(
+                "hooks.d: {err} — integrations are off this session"
+            ));
+            return (layers, errors);
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json") && path.is_file())
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        match std::fs::read_to_string(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|text| alter_zero::hooks::HooksFile::parse(&text))
+        {
+            Ok(file) => layers.push((path, file)),
+            Err(err) => errors.push(format!("hooks.d/{name}: {err} — skipped")),
+        }
+    }
+    (layers, errors)
+}
+
+/// Whether `ALTER_ZERO_HOOKS` turns every hook off for this run — the one
+/// switch that reaches the integration layer too (`docs/herdr.md`); unset
+/// leaves the layer on.
+pub(crate) fn hooks_forbidden() -> bool {
+    env_flag_set("ALTER_ZERO_HOOKS") == Some(false)
+}
+
 /// Whether the project-level `.alter-zero` config layer is discovered at all
 /// (`docs/project-config.md`) — `ALTER_ZERO_PROJECT_CONFIG`, default on.
 /// Falsy = no project hooks/MCP discovery, no pending toast, `/trust`

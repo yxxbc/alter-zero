@@ -98,9 +98,13 @@ tr_hooks="$(tmux capture-pane -t "$S83" -p)"
 echo "==== Phase 83: the merged project hook in /hooks ===="
 printf '%s\n' "$tr_hooks"
 expect_has "$tr_hooks" -F "1 hook configured" "/hooks does not count the merged project hook"
-# Stop sits past the five-row event window — the digit jumps straight into
-# its handler list, which names the project file's command.
-tmux send-keys -t "$S83" -l "7"
+# Stop sits past the five-row event window, and past the digits too: it is
+# the tenth event (`hooks::HookEvent::ALL`), so nine ↓ reach it and Enter
+# opens its handler list, which names the project file's command.
+for _ in $(seq 1 9); do
+	tmux send-keys -t "$S83" Down
+done
+tmux send-keys -t "$S83" Enter
 sleep 0.5
 tr_stop="$(tmux capture-pane -t "$S83" -p)"
 echo "==== Phase 83: the Stop handler list ===="

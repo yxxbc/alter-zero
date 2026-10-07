@@ -1,4 +1,4 @@
-//! The eleven lifecycle events a hook can attach to, and their wire names.
+//! The sixteen lifecycle events a hook can attach to, and their wire names.
 //!
 //! The names are Claude Code's `HOOK_EVENTS` spellings and are also the keys
 //! of a `hooks.json` `"hooks"` object, so they are `PascalCase` strings rather
@@ -7,18 +7,26 @@
 
 /// One point in the agent's lifecycle a hook may run at (`docs/hooks.md`).
 ///
-/// v1 fires the five **tool-path** events (the ones that run on the backend's
-/// own thread, where blocking is already correct); the rest are modelled here
-/// — payload, verdict and all — so that wiring them later is one call site
-/// each rather than a new subsystem.
+/// Claude Code's spellings throughout, plus the two a session tracker needs
+/// that it lacks — codex's `Interrupt` and Kimi Code's `PermissionResult` —
+/// under the names those tools ship them as (`docs/herdr.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HookEvent {
     /// Before a tool call runs — may allow, deny, ask, or rewrite its input.
     PreToolUse,
     /// After a tool call ran — may block, or feed the model extra context.
     PostToolUse,
+    /// After a tool call ran and **failed** — the same answers as
+    /// `PostToolUse`, which fires only for a success.
+    PostToolUseFailure,
     /// Instead of asking the user to approve a call — may allow or deny.
     PermissionRequest,
+    /// A `PermissionRequest` was decided — by the user, a hook or the
+    /// classifier. Observation only.
+    PermissionResult,
+    /// The app wants the user's attention — `permission_prompt`: a prompt is
+    /// on screen now. Observation only.
+    Notification,
     /// The user submitted a prompt — may block it, or add context.
     UserPromptSubmit,
     /// A session opened.
@@ -27,6 +35,10 @@ pub enum HookEvent {
     SessionEnd,
     /// The model stopped answering — may make it keep going.
     Stop,
+    /// The turn ended on a backend error instead. Observation only.
+    StopFailure,
+    /// The user interrupted the running turn. Observation only.
+    Interrupt,
     /// A subagent was launched.
     SubagentStart,
     /// A subagent finished — may make it keep going.
@@ -42,11 +54,16 @@ impl HookEvent {
     pub const ALL: &'static [Self] = &[
         Self::PreToolUse,
         Self::PostToolUse,
+        Self::PostToolUseFailure,
         Self::PermissionRequest,
+        Self::PermissionResult,
+        Self::Notification,
         Self::UserPromptSubmit,
         Self::SessionStart,
         Self::SessionEnd,
         Self::Stop,
+        Self::StopFailure,
+        Self::Interrupt,
         Self::SubagentStart,
         Self::SubagentStop,
         Self::PreCompact,
@@ -60,11 +77,16 @@ impl HookEvent {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::PostToolUseFailure => "PostToolUseFailure",
             Self::PermissionRequest => "PermissionRequest",
+            Self::PermissionResult => "PermissionResult",
+            Self::Notification => "Notification",
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::SessionStart => "SessionStart",
             Self::SessionEnd => "SessionEnd",
             Self::Stop => "Stop",
+            Self::StopFailure => "StopFailure",
+            Self::Interrupt => "Interrupt",
             Self::SubagentStart => "SubagentStart",
             Self::SubagentStop => "SubagentStop",
             Self::PreCompact => "PreCompact",
@@ -73,7 +95,7 @@ impl HookEvent {
     }
 
     /// The event a `hooks.json` key names, or `None` for one we don't model
-    /// (Claude Code has twenty-seven; a config mentioning `FileChanged` must
+    /// (Claude Code has thirty-odd; a config mentioning `FileChanged` must
     /// load fine and simply never fire it).
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
@@ -89,7 +111,11 @@ impl HookEvent {
     pub const fn matches_tool_names(self) -> bool {
         matches!(
             self,
-            Self::PreToolUse | Self::PostToolUse | Self::PermissionRequest
+            Self::PreToolUse
+                | Self::PostToolUse
+                | Self::PostToolUseFailure
+                | Self::PermissionRequest
+                | Self::PermissionResult
         )
     }
 }
@@ -118,6 +144,45 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "ALL has a duplicate");
-        assert_eq!(total, 11);
+        assert_eq!(total, 16);
+    }
+
+    #[test]
+    fn the_status_events_a_session_tracker_needs_are_modelled_by_their_reference_names() {
+        // herdr's full-lifecycle integrations (docs/herdr.md) key on these
+        // spellings: codex's and Kimi's `Interrupt`, Kimi's
+        // `PermissionResult`, Claude Code's `StopFailure`,
+        // `PostToolUseFailure` and `Notification`. A rename here silently
+        // stops a shared config from ever firing.
+        for name in [
+            "Interrupt",
+            "StopFailure",
+            "PostToolUseFailure",
+            "PermissionResult",
+            "Notification",
+        ] {
+            assert!(HookEvent::from_name(name).is_some(), "{name} is unmodelled");
+        }
+    }
+
+    #[test]
+    fn a_tool_events_query_is_a_tool_name_and_answers_to_its_aliases() {
+        for event in [
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::PostToolUseFailure,
+            HookEvent::PermissionRequest,
+            HookEvent::PermissionResult,
+        ] {
+            assert!(event.matches_tool_names(), "{}", event.name());
+        }
+        for event in [
+            HookEvent::Notification,
+            HookEvent::StopFailure,
+            HookEvent::Interrupt,
+            HookEvent::Stop,
+        ] {
+            assert!(!event.matches_tool_names(), "{}", event.name());
+        }
     }
 }

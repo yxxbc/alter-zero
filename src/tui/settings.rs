@@ -38,8 +38,10 @@ impl Session<'_> {
     /// path display, and whether the session actually runs the hooks — and
     /// hands all three to `App`, the `/resume` picker's injection seam.
     pub(crate) fn open_hooks_menu(&mut self) {
-        let (overview, enabled) = self.models.hooks_browse();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let (overview, enabled) = self
+            .models
+            .hooks_browse(|path| alter_zero::ui::display_cwd(path, home.as_deref()));
         let mut source = alter_zero::llm::hooks::hooks_file_path(config::config_home().as_deref())
             .map(|path| alter_zero::ui::display_cwd(&path, home.as_deref()));
         // A trusted project file is part of the merge the browser shows, so

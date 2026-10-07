@@ -45,28 +45,49 @@ references agree on the asymmetry, so we copy it exactly:
 
 - **stdin (the payload) is `snake_case`** — `session_id`, `transcript_path`,
   `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`,
-  `tool_use_id`, `agent_id`, `agent_type`. `session_id` is the session's *one*
-  id, shared with its temp tree (`docs/scratchpad.md`), so a handler can find
-  this session's scratchpad and task output from it — it used to be a second,
-  separately-minted (and therefore different) nanos-derived id.
+  `tool_use_id`, `agent_id`, `agent_type`, `scratchpad_dir`. `session_id` is
+  the **conversation's** id — Claude Code's meaning of the field, and the id
+  `--resume` takes, since it names the rollout file (`docs/resume.md`).
+  It follows the conversation: a fresh one gets a new id on `/clear`, a
+  `/resume` hands over the resumed file's, and `transcript_path` is `null`
+  until the conversation's first message creates its file. It used to be an
+  id minted at startup that the rollout never used, so a hook could not
+  resume the session it was told about (`docs/herdr.md`). At launch the two
+  are still the same id, and the session's temp tree keeps that first id
+  for the whole run (`docs/scratchpad.md`), which is why the payload names
+  that tree on its own: `scratchpad_dir`.
 - **stdout (the verdict) is `camelCase`** — `continue`, `stopReason`,
   `suppressOutput`, `systemMessage`, `decision`, `reason`,
   `hookSpecificOutput.{hookEventName,permissionDecision,
   permissionDecisionReason,updatedInput,additionalContext}`.
 
-Eleven events are modelled. What each may return:
+Sixteen events are modelled. What each may return:
 
 | event                           | the hook may return                                   |
 | ------------------------------- | ----------------------------------------------------- |
 | `PreToolUse`                    | allow / deny / ask · block + reason · `additionalContext` · `updatedInput` |
 | `PermissionRequest`             | `allow` / `deny` + message                             |
 | `PostToolUse`                   | block + reason · `additionalContext`                   |
+| `PostToolUseFailure`            | block + reason · `additionalContext` (PostToolUse's answers, for a call that failed) |
 | `UserPromptSubmit`              | block + reason · `additionalContext`                   |
 | `Stop` / `SubagentStop`         | block + reason (make the agent keep going)             |
 | `SessionStart` / `SubagentStart`| `additionalContext`                                    |
 | `SessionEnd`                    | nothing — output ignored (both references)             |
 | `PreCompact`                    | `additionalContext` / stdout → extra compact instructions — **no block** (see below) |
 | `PostCompact`                   | nothing — envelope only                                |
+| `Notification`                  | nothing — an observation (`notification_type` is the matcher) |
+| `PermissionResult`              | nothing — an observation                               |
+| `StopFailure`                   | nothing — output ignored (Claude Code's rule)          |
+| `Interrupt`                     | nothing — output ignored                               |
+
+The last four, and `PostToolUseFailure`, are what a **status tracker**
+needs and the first eleven never said: when a turn ends some way other than
+naturally, when a human is being asked, and when they answered. They were
+added for the herdr integration (`docs/herdr.md`), each from a reference
+that already defines it — `PostToolUseFailure`, `Notification` and
+`StopFailure` from Claude Code, `Interrupt` from codex, `PermissionResult`
+from Kimi Code — so a hook written for one of those tools reads the same
+payload here.
 
 **Exit codes** (Claude Code's semantics, verbatim): `0` — success, stdout is
 read as a verdict when it starts with `{`, else treated as plain text. `2` —
@@ -88,6 +109,15 @@ run was started by a `Stop` hook's block* — the loop guard — so reporting a
 failed agent through it would hand a hook author the wrong fact under a
 documented name. It is always `false` here, because nothing yet continues an
 agent from a hook. codex extends these payloads the same way, with `turn_id`.
+
+The new events add three more, for the same reason. A `permission_prompt`
+`Notification` carries the call's `tool_name` and `tool_use_id` beside
+Claude Code's `title`/`message`, so a tracker can pair the prompt with the
+`PermissionResult` that closes it — two agents can be asking at once
+(`docs/permissions.md`). `PermissionResult`'s `decision` is
+`{"behavior": "allow" | "deny", "source": "user" | "hook" | "classifier"}`,
+naming who decided. And `PostToolUseFailure`'s `is_interrupt` is always
+`false`: an interrupted call is reported by the `Interrupt` event instead.
 
 ## Matchers
 
@@ -126,22 +156,28 @@ and the other non-tool queries are never aliased.
 
 ## Where each event attaches
 
-| event               | site                                                            |
-| ------------------- | --------------------------------------------------------------- |
-| `PreToolUse`        | `llm/agent.rs` — before `approve`; **`agent` launches included** |
-| `PermissionRequest` | `llm/approval.rs` — after the standing rules                     |
-| `PostToolUse`       | `llm/agent.rs` — on `execute`'s return, **successes only**       |
-| `SubagentStart`     | `llm/backend.rs` — inside `spawn_subagent_run`                   |
-| `SubagentStop`      | `llm/agent.rs` — `run_agent`'s Complete arm, via the tagged sink |
-| `SessionStart`      | `llm/backend.rs` — the spawn top drains the queued sources       |
-| `SessionEnd`        | `tui` — `/clear` and `shutdown`, under a 2 s event budget        |
-| `UserPromptSubmit`  | `llm/backend.rs` — the spawn top, after the SessionStart drain   |
-| `Stop`              | `llm/agent.rs` — `run_agent`'s Complete arm                      |
-| `PreCompact`        | the compact spawn's top, via the `CompactHooks` wrapper          |
-| `PostCompact`       | the compact spawn's completion, via the same wrapper             |
+| event                | site                                                            |
+| -------------------- | --------------------------------------------------------------- |
+| `PreToolUse`         | `llm/agent.rs` — before `approve`; **`agent` launches included** |
+| `PermissionRequest`  | `llm/approval.rs` — after the standing rules                     |
+| `Notification`       | `llm/approval.rs` — as the prompt opens (`permission_prompt`), on the lane |
+| `PermissionResult`   | `llm/approval.rs` — once a request is decided: by a hook, the classifier or the user |
+| `PostToolUse`        | `llm/agent.rs` — on `execute`'s return, **successes only**       |
+| `PostToolUseFailure` | `llm/agent.rs` — on `execute`'s return, **failures only**        |
+| `SubagentStart`      | `llm/backend.rs` — inside `spawn_subagent_run`                   |
+| `SubagentStop`       | `llm/agent.rs` — `run_agent`'s Complete arm, via the tagged sink |
+| `SessionStart`       | `tui` — on the lane at launch, `/clear`, `/resume`, a `/login`; the spawn top waits for it |
+| `SessionEnd`         | `tui` — `/clear`, `/resume` and `shutdown`, on the lane, under a 2 s event budget |
+| `UserPromptSubmit`   | `llm/backend.rs` — the spawn top, after `SessionStart`           |
+| `Stop`               | `llm/agent.rs` — `run_agent`'s Complete arm                      |
+| `StopFailure`        | `llm/agent.rs` — a failed round, before its `Error` event       |
+| `Interrupt`          | `tui` — an Esc that stops an agent turn, on the lane             |
+| `PreCompact`         | the compact spawn's top, via the `CompactHooks` wrapper          |
+| `PostCompact`        | the compact spawn's completion, via the same wrapper             |
 
-Every one of the eleven fires. All of them run on a **backend thread** —
-none on the tokio loop — which is the second half of the story below.
+Every one of the sixteen fires, and none runs on the tokio loop: the
+backend's events run on its own threads, and the boundary's on **the lane**
+— both halves of the story below.
 
 `PermissionRequest` sits exactly where the auto-mode classifier does — after
 the standing allowlist, before the user — because it answers the same
@@ -163,17 +199,21 @@ that premise:
 - **Claude Code fires its stop hooks inside the query loop**, not at the
   REPL layer — a `Stop` block *is* the next iteration of that loop
   (`query.ts:1282-1305`), which is exactly `run_agent` here.
-- **Neither reference runs `SessionStart` at startup.** Claude Code kicks it
-  off without awaiting before render and blocks only the *first API call*
-  (`main.tsx:3761-3765`); codex queues a pending source and drains it at the
-  top of the next turn (`turn.rs:239-241`). Nothing ever blocks the first
-  paint — the checkpoint probe's lesson, honoured by both references before
-  we ever hit it.
+- **Neither reference blocks the first paint on `SessionStart`.** Claude
+  Code kicks it off without awaiting before render and blocks only the
+  *first API call* (`main.tsx:3761-3765`); codex queues a pending source and
+  drains it at the top of the next turn (`turn.rs:239-241`) — the
+  checkpoint probe's lesson, honoured by both references before we ever hit
+  it. This engine began with codex's drain and has since moved to Claude
+  Code's timing (below): a session tracker must hear of a session when it
+  opens, not at its first prompt (`docs/herdr.md`).
 
-So every event lands on a **backend thread**, where blocking is already
-normal and correct — the permission gate parks there on a `Condvar`,
-`llm::exec` polls its children every 20 ms — and the loop-thread problem
-never existed:
+So every event the agent fires lands on a **backend thread**, where
+blocking is already normal and correct — the permission gate parks there on
+a `Condvar`, `llm::exec` polls its children every 20 ms — and the
+loop-thread problem never existed. The few the **boundary** fires (the
+session's start and end, an Esc) run on an ordered lane of their own,
+described after the list:
 
 - **`Stop`/`SubagentStop`** fire in `run_agent` at `RoundOutcome::Complete`,
   before `StreamDone`. A block appends the reply-so-far as an assistant
@@ -185,19 +225,24 @@ never existed:
   writes are inside the turn's snapshot and an Esc-Esc backtrack restores
   them. By construction it never fires for a `/compact` turn (that backend
   carries the wrapper below), a `!` shell (no agent loop), a backend error
-  (Claude Code fires `StopFailure` there, which we don't model), or an
-  interrupt (Claude Code returns before stop hooks on an abort — Esc always
-  breaks a continuation chain). The engine never refuses a re-block:
+  (that is `StopFailure`'s, below), or an interrupt (Claude Code returns
+  before stop hooks on an abort — Esc always breaks a continuation chain,
+  and fires `Interrupt` instead). The engine never refuses a re-block:
   `stop_hook_active` is the hook's own guard, the reference's exact posture.
   The tagged sink routes a subagent's completion to `SubagentStop`
   (matcher = agent type) with the same block-to-continue semantics on the
   agent's own loop; a killed or errored agent fires nothing.
-- **`SessionStart`** is a queued-source drain: bootstrap queues `startup`
-  (a `--continue`/`--resume` boot swaps it for `resume`), `/clear` queues
-  `clear`, a `/resume` load queues `resume`, and the next spawn's thread
-  drains the queue before round 1 (matcher = source). Context lands as
-  user messages after the prompt and is recorded (see `HookNote` below).
-- **`UserPromptSubmit`** fires right after that drain, before the first
+- **`SessionStart`** fires **at the boundary it describes**, in the
+  background on the lane: right after the first frame paints (`startup`,
+  or `resume` for a `--continue`/`--resume` boot), on `/clear` (`clear`),
+  on a `/resume` load (`resume`) — and, for a session that ran the offline
+  demo until a `/login`, at that switch (matcher = source). Its context
+  waits in `HookHandles::held`: the next spawn waits for the lane before
+  round 1 and takes it, so it still lands as user messages after the
+  prompt and is recorded (see `HookNote` below). A context the next
+  conversation must not read — a `/clear` or `/resume` that came first — is
+  dropped with the conversation it was for.
+- **`UserPromptSubmit`** fires right after `SessionStart`, before the first
   request. A **block** streams `StreamEvent::PromptBlocked` instead of
   anything else: the loop rolls the just-recorded submission back out of
   history (the recorder's shrink-rewrite erases it from the rollout — the
@@ -218,15 +263,83 @@ never existed:
   wrapper never drains the session-source queue and never continues a
   summarization; its notes stay out of the conversation record (they are
   ephemeral, like the compact chunks themselves).
-- **`SessionEnd`** fires on `/clear` (`clear`) and at quit
-  (`prompt_input_exit`), under a **2 s whole-event budget** — Claude Code
-  caps this event at 1.5 s and codex clamps it to 3 s, because quitting must
-  never hang on a hook. Output is ignored, as in both references. It fires
-  **only when a real backend is active**, keeping the pair honest: a
-  dummy-only session drains no `SessionStart` (the queue drains at a real
-  spawn's top), so it fires no `SessionEnd` either — a session-logging hook
-  never sees an end without its start. A `/login` mid-session makes the
-  pair real: the next turn drains `startup`, and the end fires at quit.
+- **`SessionEnd`** fires on `/clear` (`clear`), on a `/resume` load
+  (`resume` — naming the conversation being left, before the recorder
+  adopts the next) and at quit (`prompt_input_exit`), under a **2 s
+  whole-event budget** — Claude Code caps this event at 1.5 s and codex
+  clamps it to 3 s, because quitting must never hang on a hook. Output is
+  ignored, as in both references. A quit drops whatever the lane still
+  holds and reaps its running job first, so a slow `SessionStart` cannot
+  spend the budget.
+- **`Interrupt`** (codex's event) fires when an Esc stops an agent turn —
+  whether it kept what streamed or undid the submission — on the lane,
+  under the same 2 s budget, output ignored. A `!` shell turn fires nothing
+  (it never told the hooks it started). Without it a status tracker saw a
+  turn start and never end: Esc fired nothing at all — the bug codex fixed
+  by adding this event (openai/codex#22858).
+- **`StopFailure`** (Claude Code's) fires when a round fails — the
+  provider's error once the retries are spent, or the tool-call ceiling —
+  with the error's **type** as the matcher: `rate_limit` (429),
+  `overloaded` (529), `authentication_failed` (401, 403), `billing_error`
+  (402), `model_not_found` (404), `invalid_request` (any other 4xx),
+  `server_error` (5xx, a failed connection) or `unknown` (anything else, the
+  ceiling included), beside `error_details` and `last_assistant_message`.
+  It runs before the `Error` event is sent, so its hooks finish before the
+  user can start the next turn; it is the lead's only (a subagent's failed
+  round is its own business, like `Stop`), and never an interrupt's.
+- **`PostToolUseFailure`** (Claude Code's) is `PostToolUse` for a call that
+  ran and failed — a command's non-zero exit, a refused edit, a question the
+  user declined or let time out — with the same answers, `error` holding
+  the failure text. A background launch fires neither.
+- **`Notification` and `PermissionResult`** say a human is being asked, and
+  has answered. `PermissionRequest` cannot: it fires before auto mode's
+  classifier and may be decided without anyone seeing a prompt. So the
+  prompt opening fires `Notification` (`permission_prompt`, Claude Code's
+  type, titled `Permission needed` over `Alter Zero needs your permission to
+  use Bash`), and every decided request fires `PermissionResult` (Kimi
+  Code's event) naming who decided it — the user, a `PermissionRequest`
+  hook, or the classifier. A standing rule decides nothing, so it raises
+  neither; a request reaped by Esc gets no result (the `Interrupt` that
+  follows is the record). The `Notification` is queued on the lane under
+  the **turn's** token rather than run inline: the gate waits at once, the
+  `Interrupt` of an Esc on that very prompt can never reach a hook before
+  it — a tracker would read *idle*, then *blocked*, and show a prompt
+  nobody can answer — and that Esc still reaps a notifier that hangs.
+- **The boundary's events need a real backend**, which keeps the pairs
+  honest: the offline demo fires no hooks, so a dummy-only session fires no
+  `SessionStart`, and so no `SessionEnd` or `Interrupt` either — a
+  session-logging hook never sees an end without its start. A `/login`
+  mid-session makes the session real: its queued `startup` fires at the
+  switch, and the end fires at quit.
+
+### The lane
+
+The boundary fires its events from the UI thread, which must never wait on
+a hook — and they race the backend's: an Esc's `Interrupt` and the
+`UserPromptSubmit` of the turn the user starts right after it are fired a
+keystroke apart from two threads, and a tracker that hears them in the
+wrong order ends on *idle* while the agent works. `llm::hooks::HookLane` is
+the answer: the boundary's events — `SessionStart`, `SessionEnd`,
+`Interrupt`, and the prompt's `Notification` — are jobs on one FIFO lane,
+each run off the caller's thread in submission order, and **every hook the
+backend dispatches first waits for the lane to drain** (polling its turn's
+token, so an Esc still frees it). Each job's payload is resolved when it is
+**fired**, not when it runs (`CommandHooks::pinned`): a `/resume` fires
+`SessionEnd` and adopts the next conversation in the same breath, and the
+event must still name the conversation that ended.
+
+The order has to hold the other way too: an event that **ends** a turn must
+not be overtaken by that turn's own hooks. An Esc cancels the turn, and the
+runner reaps its running hook within a 20 ms poll — but until then the hook
+can still write, and a status reporter mid-flight would land its *working*
+after the `Interrupt`'s *idle*. So every backend dispatch registers its
+turn's token while it runs (`llm::hooks::InFlight`), and the `Interrupt` and
+`SessionEnd` jobs first wait (`REAP_WAIT`, 1 s at most) until no running
+dispatch belongs to a cancelled turn. A quit cancels a running turn before
+it fires `SessionEnd`, so the same wait covers it; a background agent's
+hooks, whose turn nothing ended, are never waited for. The prompt's
+`Notification` gets the guarantee from the lane itself: it is a job, so the
+`Interrupt` queues behind it.
 
 **A blocking hook must poll the `CancelToken`.** The reason the existing
 `Condvar` park is safe is that `PermissionGate::wait` takes a cancellation
@@ -367,7 +480,11 @@ The child is spawned through the same **tty-detach tier walk** every other
 shell child uses (`docs/tty-detach.md`), so a hook that tries to prompt on
 `/dev/tty` fails fast instead of hijacking the TUI. It inherits the session's
 cwd and gets `ALTER_ZERO_PROJECT_DIR` — plus `CLAUDE_PROJECT_DIR`, so scripts
-written for Claude Code find their project root unchanged.
+written for Claude Code find their project root unchanged — and
+`ALTER_ZERO_BIN_PATH`, the running binary, the way herdr names its own in
+`HERDR_BIN_PATH`: a hook that calls back into Alter Zero
+(`"$ALTER_ZERO_BIN_PATH" integration hook herdr`) needs no absolute path
+written into a file that would go stale when the binary moves or updates.
 
 The `/settings` menu carries a **Hooks** row. It is a plain on/off toggle,
 which is all a cycling menu with no free-text field can ever offer, and it
@@ -377,6 +494,21 @@ hooks file written for one project should not fire in every project, so a
 directory opts in — one cycle records `"hooks": true` in its `settings.json`
 entry. `ALTER_ZERO_HOOKS` seeds the row for a run (`=1` on, a falsy value
 off — the `ALTER_ZERO_TOOLS` pattern) and is never saved.
+
+**A third layer runs everywhere: `{config_home}/hooks.d/`.** The row is
+right for `hooks.json`, which holds a user's guards and formatters, and
+wrong for an **integration** — a hook that connects Alter Zero to the
+terminal it runs in belongs to every directory, and one that waits for a
+per-directory opt-in reports nothing from the next project the user opens.
+So each `hooks.d/*.json` (a whole `hooks.json` apiece, written by an
+installer such as `alter-zero integration install herdr`, `docs/herdr.md`)
+is union-merged after the user's file and the trusted project file, in
+file-name order, and runs **whatever the row says**. Only
+`ALTER_ZERO_HOOKS=0` turns it off with the rest. It needs no trust gate:
+it lives in the config home, beside the `hooks.json` that is trusted for
+the same reason. A file that will not parse is a red startup toast naming
+it, and the others still load. `/hooks` labels its entries `Integration`
+and names their file on the detail page (`docs/hooks-menu.md`).
 
 ## Module layout
 
@@ -394,40 +526,47 @@ and merge rule is unit-testable from fixtures with no process anywhere — the
 same split `session`/`history` use for their JSONL formats. Only the spawn is
 boundary code.
 
-### The seam: one trait, not eleven closures
+### The seam: one trait, not sixteen closures
 
 `run_agent` already takes nine parameters under an
 `#[allow(clippy::too_many_arguments)]`. Adding a closure per hook event is how
-this feature rots into eleven hand-wired call sites and an unreviewable
+this feature rots into sixteen hand-wired call sites and an unreviewable
 signature. Instead there is one trait object with defaulted no-op methods:
 
 ```rust
 pub trait HookSink: Send + Sync + Debug {
     fn pre_tool_use(&self, …) -> PreToolVerdict { PreToolVerdict::default() }
     fn post_tool_use(&self, …) -> PostToolVerdict { PostToolVerdict::default() }
+    fn post_tool_use_failure(&self, …) -> PostToolVerdict { PostToolVerdict::default() }
     fn permission_request(&self, …) -> Option<HookPermissionVerdict> { None }
+    fn permission_prompt(&self, _call: &ToolCallRequest, _cancel: &CancelToken) {}
+    fn permission_result(&self, …, _source: PermissionSource, _cancel: &CancelToken) {}
     fn subagent_start(&self, …) -> Vec<String> { Vec::new() }
     fn stop(&self, _active: bool, _last: &str, _cancel: &CancelToken) -> Option<String> { None }
+    fn stop_failure(&self, _error: &str, _details: &str, _cancel: &CancelToken) {}
     fn session_start(&self, _cancel: &CancelToken) -> Vec<String> { Vec::new() }
     fn user_prompt_submit(&self, _prompt: &str, _cancel: &CancelToken) -> PromptVerdict { … }
     fn session_end(&self, _reason: &str) {}
+    fn interrupt(&self) {}
     fn for_subagent(&self, …) -> Option<Arc<dyn HookSink>> { None }
     fn prompt_hook_label(&self) -> &'static str { "UserPromptSubmit" }
 }
 ```
 
 Every blocking method takes the turn's `CancelToken` — the trait says one
-thing about blocking, and the one exception (`session_end`, which runs past
-cancellation under its own 2 s budget) says so at the method. `stop` routes
-itself: the lead sink fires `Stop`, a `for_subagent`-tagged one fires
-`SubagentStop` — Claude Code picks the event the same way, by the presence
-of an agent id.
+thing about blocking, and the two exceptions (`session_end` and `interrupt`,
+which run past cancellation under their own 2 s budget) say so at the
+method. `stop` routes itself: the lead sink fires `Stop`, a
+`for_subagent`-tagged one fires `SubagentStop` — Claude Code picks the event
+the same way, by the presence of an agent id. The boundary does not fire
+through the trait: it owns the concrete `CommandHooks`, whose `fire_*`
+methods put the boundary's events on the lane.
 
 Every method defaults, so `NoHooks` costs nothing and every existing test
-compiles untouched. **Adding event number six is one defaulted method plus one
-call site** — not a wider signature and not a new subsystem. That property is
-the whole point of the design; if a later change breaks it, the change is
-wrong.
+compiles untouched. **Adding an event is one defaulted method plus one call
+site** — not a wider signature and not a new subsystem; the five the herdr
+integration needed were exactly that, each. That property is the whole
+point of the design; if a later change breaks it, the change is wrong.
 
 ## Deliberately not doing
 
@@ -440,8 +579,8 @@ wrong.
 - **Output spilling.** codex writes an oversized `additionalContext` to disk
   with a preview. We cap and truncate (`HOOK_OUTPUT_MAX_BYTES`) instead until
   someone needs more.
-- **A hooks browser UI.** codex has one. The `/settings` on/off row is the
-  whole surface.
+- **Editing hooks from the UI.** `/hooks` browses them read-only
+  (`docs/hooks-menu.md`); the files are the configuration.
 
 ## Offline coverage
 
@@ -480,13 +619,28 @@ Three layers cover the rest:
 - the **pure core** is unit-tested from fixtures with no process anywhere;
 - the **runner** has real-`sh` tests beside `llm::exec`'s — a hook reading the
   payload off stdin and blocking on what it finds, a timeout being reaped, a
-  cancelled turn reaping a running hook, a missing command failing open;
-- the **wiring** has `run_agent` tests over a fake sink, and three
+  cancelled turn reaping a running hook, a missing command failing open —
+  and the lane's: jobs in submission order, a dispatch never overtaking an
+  `Interrupt`, an `Interrupt` never landing ahead of the prompt it closed
+  (while the turn's Esc still reaps that prompt's hung notifier), a quit
+  that reaps a slow `SessionStart` before its `SessionEnd`, and a payload
+  naming the conversation it was fired for;
+- the **wiring** has `run_agent` and `approve_call` tests over fake sinks —
+  `PostToolUseFailure` for a failed call only, `StopFailure` classified and
+  sent before the error, `Notification` then `PermissionResult` around a
+  prompt and neither for a standing rule — and three
   `#[ignore]`d **live** tests in `tests/live_openrouter.rs` that put a real
   model through a real `hooks.json`: a `PreToolUse` block (the command never
   runs), a `PostToolUse` `additionalContext` (the model reads the injected
   fact and repeats it), and an `updatedInput` rewrite (the hook's command is
   what executes).
+
+The boundary's own events need a real backend, so their smoke coverage
+runs against a stub provider: **Phase 132** installs the herdr integration
+and reads the reporter's requests off a stub herdr socket — `SessionStart`
+at launch, a turn's `UserPromptSubmit` and `Stop`, a prompt's
+`Notification`, an Esc's `Interrupt` and the quit's `SessionEnd`, in that
+order, each carrying the conversation's resumable id (`docs/herdr.md`).
 
 ## Deliberate deviations from the references
 
@@ -526,10 +680,14 @@ Verified against both sources, and chosen — not accidental:
 
 - **`"async": true` runs synchronously**, with a warning. So does a
   `statusMessage`, which is parsed and not displayed.
-- **`PostToolUseFailure`, `StopFailure`, `Notification` and the rest of
-  Claude Code's twenty-seven events are unmodelled.** A failed tool call
-  fires nothing (PostToolUse fires only on success, both references'
-  behaviour); a config naming them loads fine and never fires.
+- **The rest of Claude Code's twenty-seven events are unmodelled**, and
+  `Notification` fires only its `permission_prompt` type — a question from
+  `askuserquestion` is a tool call, which `PreToolUse` already announces. A
+  config naming an unmodelled event loads fine and never fires.
+- **No event follows a prompt another hook refused.** When one
+  `UserPromptSubmit` handler blocks the prompt, its siblings have already
+  run — a tracker one of them told *working* stays there until the next
+  turn. Neither reference fires anything after a refused prompt either.
 - **A PermissionRequest hook that abstains loses its warnings** — the
   fail-open posture has no channel to the user from that position; a
   deciding verdict carries them on its note.

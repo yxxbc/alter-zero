@@ -104,8 +104,11 @@ fn names_utf8(locale: &str) -> bool {
 }
 
 /// Apply the session environment to `command`: [`TERMINAL_ENV`] set,
-/// [`FOREIGN_TERMINAL_VARS`] removed, and a UTF-8 locale given where the
-/// environment names none ([`utf8_locale`]).
+/// [`FOREIGN_TERMINAL_VARS`] removed, a UTF-8 locale given where the
+/// environment names none ([`utf8_locale`]), and the agent's own marker —
+/// [`crate::herdr::NESTED_VAR`]: an Alter Zero started from this terminal
+/// shares the herdr pane's variables, and must know the pane belongs to the
+/// session that started it (`docs/herdr.md`).
 #[cfg(unix)]
 pub fn apply_terminal_env(command: &mut Command) {
     for name in FOREIGN_TERMINAL_VARS {
@@ -114,6 +117,7 @@ pub fn apply_terminal_env(command: &mut Command) {
     for (name, value) in TERMINAL_ENV {
         command.env(name, value);
     }
+    command.env(crate::herdr::NESTED_VAR, "1");
     if let Some((name, value)) = utf8_locale(|name| std::env::var(name).ok()) {
         command.env(name, value);
     }
@@ -690,6 +694,9 @@ mod tests {
         assert_eq!(value("GIT_PAGER"), Some(Some("cat".to_string())));
         assert_eq!(value("TMUX"), Some(None), "removed, not inherited");
         assert_eq!(value("COLUMNS"), Some(None), "a stale size is removed");
+        // An Alter Zero started from here knows the herdr pane it inherited
+        // belongs to the session that started it (docs/herdr.md).
+        assert_eq!(value(crate::herdr::NESTED_VAR), Some(Some("1".to_string())));
     }
 
     /// An environment of `pairs` for [`utf8_locale`].

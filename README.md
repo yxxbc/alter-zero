@@ -273,6 +273,7 @@ The essentials are always one keystroke away: `/` opens commands, and `?` in an 
 ```text
 Usage: alter-zero [OPTIONS] [PROMPT]
        alter-zero mcp <COMMAND>
+       alter-zero integration <COMMAND>
        alter-zero update
 
 Arguments:
@@ -292,7 +293,7 @@ alter-zero "fix the failing test"
 alter-zero -c "now review the changes"
 ```
 
-Run `alter-zero mcp --help` for MCP server management commands, and `alter-zero update` to install the newest release over the binary you are running.
+Run `alter-zero mcp --help` for MCP server management commands, `alter-zero integration install herdr` to show the agent's state in a [herdr](https://herdr.dev) pane, and `alter-zero update` to install the newest release over the binary you are running.
 
 </details>
 
@@ -308,6 +309,7 @@ Your sign-ins, saved sessions, input history, and per-directory settings live un
 | `~/.alter-zero/.env` | Keys and tokens saved through `/login` |
 | `~/.alter-zero/agents/` and `~/.alter-zero/skills/` | Your shared agent definitions and skills |
 | `~/.alter-zero/hooks.json` and `~/.alter-zero/mcp.json` | Your shared hooks and MCP servers |
+| `~/.alter-zero/hooks.d/` | Hooks installed by `alter-zero integration`, which run in every directory |
 | `.alter-zero/` in a project | Project-specific `agents/`, `skills/`, `hooks.json`, and `mcp.json` |
 | `AGENTS.md` | Project instructions read by the agent |
 

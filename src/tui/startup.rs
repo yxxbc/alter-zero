@@ -60,12 +60,12 @@ pub(crate) struct LoadedSession {
 /// here; the TUI never starts on an error path.
 pub(crate) fn resolve_cli() -> Result<Startup, i32> {
     let parsed = cli::parse(std::env::args().skip(1)).map_err(|message| {
-        // An `mcp` grammar error gets the subcommand's own usage block
-        // (`mcp` only ever routes as the first argument).
-        let page = if std::env::args().nth(1).is_some_and(|first| first == "mcp") {
-            HelpPage::Mcp
-        } else {
-            HelpPage::Main
+        // A subcommand's grammar error gets its own usage block (each only
+        // ever routes as the first argument).
+        let page = match std::env::args().nth(1).as_deref() {
+            Some("mcp") => HelpPage::Mcp,
+            Some("integration") => HelpPage::Integration,
+            _ => HelpPage::Main,
         };
         let style = help_style(std::io::stderr().is_terminal());
         eprintln!("{}", cli::usage_error(page, &message, style));
@@ -81,6 +81,9 @@ pub(crate) fn resolve_cli() -> Result<Startup, i32> {
         Cli::Mcp(cmd) => Err(super::mcp_cli::run(&cmd)),
         // `alter-zero update` (docs/update.md): the same print-and-exit path.
         Cli::Update => Err(super::update_cli::run()),
+        // `alter-zero integration …` (docs/herdr.md) — the installed hooks'
+        // reporter included, which must never start a TUI.
+        Cli::Integration(cmd) => Err(super::integration_cli::run(&cmd)),
         Cli::Version => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Err(0)

@@ -332,6 +332,12 @@ impl Session<'_> {
             self.commit_error_notice(&format!("Failed to load session: {}", path.display()));
             return Ok(());
         };
+        // The session boundary for the hooks (docs/hooks.md): the
+        // conversation on screen ends — `SessionEnd(resume)`, Claude Code's
+        // reason for switching sessions — and it must name the one being
+        // left, so it fires before anything below (the model, the recorder)
+        // moves on.
+        self.models.end_conversation("resume");
         let count = items.len();
         // The code-reset side of resume (docs/checkpoint.md): restore the cwd to
         // the session's *final* checkpoint so the files match the transcript
@@ -368,9 +374,9 @@ impl Session<'_> {
             model.honoured,
         );
         self.record_session_model(false);
-        // The session boundary for the hooks: SessionStart(resume) fires at
-        // the next turn's top (docs/hooks.md).
-        self.models.queue_session_source("resume");
+        // …and SessionStart(resume) for the conversation it adopted, in the
+        // background on the hooks' lane (docs/hooks.md).
+        self.models.begin_conversation("resume");
         self.term.exit_overlay()?;
         // A resumed session REPLACES the whole conversation: purge-rebuild
         // (like /clear) so the loaded history fills scrollback — a plain

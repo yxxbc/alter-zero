@@ -11,10 +11,13 @@ failing test"` boots straight into that turn, and `alter-zero --resume {id}
 "and now the docs"` sends it into the reopened conversation — and `--help`
 is a titled, sectioned page in the app's own colour. (The same pre-TUI
 boundary also answers the `mcp` subcommand family — `alter-zero mcp
-add/add-json/remove/get/list`, `docs/mcp-cli.md` — and `alter-zero
-update`, which installs the newest release over this binary through the
-one-line installer, `docs/update.md`; each is routed by its first argument
-before the flag grammar below applies.)
+add/add-json/remove/get/list`, `docs/mcp-cli.md` — the `integration`
+family — `alter-zero integration install/uninstall <NAME>` and `status`,
+which manage an integration's always-on hooks file, and the `integration
+hook <NAME>` those hooks run, `docs/herdr.md` — and `alter-zero update`,
+which installs the newest release over this binary through the one-line
+installer, `docs/update.md`; each is routed by its first argument before
+the flag grammar below applies.)
 
 ```
 $ alter-zero --help
@@ -24,11 +27,14 @@ Starts an interactive session by default — a quoted PROMPT is its first turn.
 
 Usage: alter-zero [OPTIONS] [PROMPT]
        alter-zero mcp <COMMAND>
+       alter-zero integration <COMMAND>
        alter-zero update
 
 Commands:
   mcp                 Manage MCP servers in the user config file — see
                       alter-zero mcp --help
+  integration         Connect another tool, such as the herdr multiplexer — see
+                      alter-zero integration --help
   update              Install the newest release over this binary, if one is
                       out — the one-line installer, checksum-verified
 
@@ -204,6 +210,7 @@ error: unrecognized argument: --frob
 
 Usage: alter-zero [OPTIONS] [PROMPT]
        alter-zero mcp <COMMAND>
+       alter-zero integration <COMMAND>
        alter-zero update
 
 For more information, try '--help'.
@@ -211,20 +218,23 @@ For more information, try '--help'.
 
 `cli::usage_error(page, message, style)` renders it — the `error:` lead,
 the page's own `Usage:` block, the pointer at `--help` — and the `mcp`
-page's grammar errors take the same shape over its six usage lines. Exit
-`2`, on stderr, as before.
+page's grammar errors take the same shape over its six usage lines, the
+`integration` page's over its three. Exit `2`, on stderr, as before.
 
 ### The pure `cli` module (src/cli.rs)
 
 - `Cli` — the parsed invocation: `Session(SessionArgs)` (the TUI run — how
   to start, plus the optional prompt), `Help`, `Version`, `Mcp(McpCli)`,
-  `Update` (the `update` subcommand — `tui::update_cli::run` does the work,
-  `docs/update.md`).
+  `Integration(IntegrationCli)` (`tui::integration_cli::run` does the work,
+  `docs/herdr.md`), `Update` (the `update` subcommand —
+  `tui::update_cli::run` does the work, `docs/update.md`).
   `SessionArgs { start: SessionStart, prompt: Option<String> }` with
   `SessionStart::{Fresh, Continue, Resume(Option<String>)}`.
 - `parse(args)` — over `std::env::args().skip(1)`: a first argument of
-  `mcp` or `update` routes to that subcommand (`update` takes nothing — a
-  trailing argument is a usage error, never a guess); else `--continue`/`-c`,
+  `mcp`, `integration` or `update` routes to that subcommand (`update`
+  takes nothing — a trailing argument is a usage error, never a guess;
+  `integration hook <NAME>` is the one lenient form, since a hook must
+  never fail: an unknown name parses and does nothing); else `--continue`/`-c`,
   `--resume [id]`/`-r [id]` (also `--resume=id`), `--help`/`-h`,
   `--version`/`-V`, one positional `[PROMPT]`, `--` before it. Anything
   else — unknown flags, a second positional, `--continue --resume`

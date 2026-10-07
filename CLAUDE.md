@@ -185,12 +185,12 @@ pays for and why (`moxcms` under `image`, the sixel quantiser under
 ## Architecture
 
 A **library** (`src/lib.rs` → `app`, `stream`, `ui`, `term`, `frame`, `paste`,
-`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `cli`, `links`, `images`) holds the logic; **`src/main.rs`** is a 77-line shell —
+`session`, `subprocess`, `pty`, `history`, `textarea`, `file_search`, `clipboard`, `context`, `background`, `scratchpad`, `secrets`, `agents`, `subagents`, `frontmatter`, `ask`, `tasks`, `skills`, `steer`, `mcp`, `trust`, `checkpoint`, `project_doc`, `reminder`, `permission`, `settings`, `telemetry`, `update`, `tips`, `cli`, `links`, `images`, `herdr`) holds the logic; **`src/main.rs`** is a 77-line shell —
 the detached-exec hook, the CLI resolution, the viewport, the loop — over
 **`src/tui/`**, the binary-private tree that drives the codex-style **async
 (tokio) `select!`** loop (`event_loop`, `actions`, `turn`, `stream`, `agent`,
 `background`, `permission`, `ask`, `view`, `commit`, `models`, `config`, `bootstrap`,
-`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
+`startup`, `recorder`, `resume`, `history_store`, `settings`, `telemetry`, `update`, `update_cli`, `integration_cli`, `shell`, `workers`, `host`, `mascot`, `spinner`, `theme`, `donate`, `export`, `secrets`, `mcp`, `trust`, `login`,
 with the **`Session`** struct itself in `mod.rs` — every handler is an `impl
 Session` block in its area module, reaching the private fields the way `app/`'s
 submodules reach `App`'s). The four big ones are **directories
@@ -1800,7 +1800,7 @@ saving); `event`; `payload`; `verdict`; `overview` — the display tree the
 read-only `/hooks` menu browses), taking a handler's stdout **as a
 string** so every rule is unit-testable with no process anywhere. The boundary
 is **`src/llm/hooks.rs`**: the `HookSink` trait — *one trait object with
-defaulted no-op methods*, not a closure per event, so adding event number six
+defaulted no-op methods*, not a closure per event, so adding an event
 is one defaulted method plus one call site rather than a wider `run_agent`
 signature — plus the runner, which spawns through
 `subprocess::spawn_shell_with` (the tty-detach tier walk with **piped stdin**,
@@ -1810,30 +1810,50 @@ waits on `llm::exec`'s 20 ms poll cadence, **re-checking the turn's
 skipped that would silently break Esc — the payload write included, on its
 own thread, since a pipe-buffer-filling `PostToolUse` payload fed to a
 handler that never reads stdin used to park an inline `write_all` past both
-Esc and the timeout. **All eleven events fire, every one on a backend
-thread** — verifying the references dissolved the old loop-path premise
-(Claude Code runs its stop hooks *inside the query loop*, and neither
-reference runs SessionStart at startup — both block only the next request):
-the tool-path five gate/annotate/rewrite calls (**`agent` launches
+Esc and the timeout. **All sixteen events fire, none on the tokio loop** —
+the agent's on a backend thread (verifying the references dissolved the old
+loop-path premise: Claude Code runs its stop hooks *inside the query
+loop*), the boundary's on **the lane** (`HookLane`: one FIFO of jobs off
+the UI thread — `SessionStart`, `SessionEnd`, `Interrupt` and a permission
+prompt's `Notification`, the last under the turn's own token so Esc still
+reaps it — that every backend dispatch waits behind, each payload pinned
+when fired, so an Esc's `Interrupt` reaches a hook after the `Notification`
+of the prompt it closed and before the next turn's `UserPromptSubmit`; and
+after every hook of the turn it ended, since `Interrupt`/`SessionEnd` wait
+until no running dispatch belongs to a cancelled turn — `InFlight` — and a
+quit cancels a running turn before its `SessionEnd`):
+the tool-path gate/annotate/rewrite calls (**`agent` launches
 included** — `Task` aliases to `agent`, and each tool name answers to its
 Claude Code spelling as a second exact name; `PostToolUse` fires only for a
-call that **succeeded**, both references' behaviour), `Stop`/`SubagentStop`
+call that **succeeded**, both references' behaviour, `PostToolUseFailure`
+for one that failed), `Stop`/`SubagentStop`
 fire in `run_agent`'s Complete arm where a block is a **same-turn
 continuation** (the reply-so-far becomes an assistant message, the feedback
 the next user message, `stop_hook_active` flips true and is the hook's own
 guard — the engine never refuses a re-block, the reference's posture, and an
 interrupt never fires Stop so Esc always breaks a chain; the turn-end
 checkpoint lands after every continuation, so a formatter hook's writes are
-inside the snapshot), `SessionStart` drains queued sources
-(`startup`/`resume`/`clear`) at the next spawn's top, `UserPromptSubmit` can
+inside the snapshot), `SessionStart` fires in the background at the
+boundary it describes — after the first frame (`startup`, or `resume` for a
+`--continue`/`--resume` boot), on `/clear`, on a `/resume` load, at the
+`/login` that makes a demo session real — Claude Code's timing, its context
+held for the next spawn, which waits for it, `UserPromptSubmit` can
 refuse the prompt — `StreamEvent::PromptBlocked`, the submission rolled back
 out of history *and* the rollout (the recorder's shrink-rewrite), the text
 returned to the composer under a red reason-only notice — or inject context,
 a loop-initiated background follow-up turn being marked synthetic and
 skipped; `PreCompact`/`PostCompact` ride the summarization spawn via the
 `CompactHooks` wrapper (PreCompact stdout/context = extra compact
-instructions, **no block — neither reference honours one**), and
-`SessionEnd` runs under a 2 s whole-event budget at `/clear`/quit. A block
+instructions, **no block — neither reference honours one**),
+`SessionEnd` (`clear`/`resume`/`prompt_input_exit`) and `Interrupt` (an Esc
+that stops an agent turn — codex's event; without it Esc fired nothing) run
+under a 2 s whole-event budget, `StopFailure` fires on a failed round with
+the error type as its matcher before the `Error` event leaves, and
+`Notification` (`permission_prompt`) as a prompt opens with
+`PermissionResult` (`decision: {behavior, source}`) once a request is
+decided — so a tracker knows when a human is being asked, which
+`PermissionRequest`, fired before the classifier, cannot say; every
+boundary event needs a real backend, the offline demo firing no hooks. A block
 *is* `Approval::Reject`'s two-text split (red cell, model-facing instruction,
 `ToolCall::context_output`, `/resume`-safe), a `PreToolUse` allow *is*
 `Approval::AllowNoted` (`permissionDecision: "ask"` skips the allowlist
@@ -1848,16 +1868,23 @@ inline, expanded in Ctrl+O, replayed verbatim by `context_messages`,
 rollout-round-tripped) and the terminal `PromptBlocked`. `PreToolUse` may
 also **rewrite** the call (`updatedInput` replaces the arguments for the
 gate, the executor and the cell), `PermissionRequest` sits exactly where the
-auto-mode classifier does, and payloads resolve `permission_mode` and
-`transcript_path` **live at dispatch** (the gate's current mode; the rollout
-path the recorder publishes into a shared cell). User-level config only — a
-project layer needs a trust model, and layers
-would union, so it stays purely additive; a malformed file is a red startup
-toast, not a silent "no hooks". `/settings` gains a **Hooks** row, unavailable
-when no file resolved and **off until a directory turns it on**
+auto-mode classifier does, and payloads resolve `permission_mode`,
+`session_id` and `transcript_path` **live at dispatch** (the gate's current
+mode; the **conversation's** id — the rollout's, the one `--resume` takes,
+moving with `/clear` and `/resume` — and its path, both of which the
+recorder publishes into a shared cell; `scratchpad_dir` names the temp tree,
+which keeps the session's first id). Three layers, union-merged: the user's
+file, the trusted project file (`docs/project-config.md`), and the
+**integrations** in `{config_home}/hooks.d/*.json`, which run whatever the
+Hooks row says (a hook connecting Alter Zero to the terminal belongs to
+every directory) and only `ALTER_ZERO_HOOKS=0` silences; every hook child
+gets `ALTER_ZERO_BIN_PATH`, the running binary; a malformed file is a red
+startup toast, not a silent "no hooks". `/settings` gains a **Hooks** row,
+unavailable when no file resolved and **off until a directory turns it on**
 (`docs/per-directory-state.md`); `ALTER_ZERO_HOOKS` seeds it for a run and
 `ALTER_ZERO_HOOKS_FILE` locates the file; the offline `hook` scenario drives the tool-path shape and the
-`prompt-block` scenario the rollback, `smoke.sh` Phases 72 and 73) in
+`prompt-block` scenario the rollback, `smoke.sh` Phases 72 and 73, and
+Phase 132 the boundary's events through herdr's reporter) in
 `docs/hooks.md`; and the **read-only `/hooks` menu** (Claude Code's `/hooks`
 browser, `docs/hooks-menu.md`: the fourth composer-replacing inline picker —
 no text entry, so the hardware cursor hides while its seat tracks the
@@ -1867,9 +1894,33 @@ hooks → detail over `hooks::HooksOverview`, the digest of the runner's own
 parsed file; ↑/↓/digits/Enter/Esc, a five-row selection-centered window
 with ↑/↓ overflow markers, per-event summaries/descriptions stating **this**
 runner's exit-code semantics, matcher level only for the events whose
-dispatch matches on something (`hooks::event_has_matchers` — `Stop` and
-`UserPromptSubmit` skip it), the detail page's rounded box holding the real
-command word-wrapped, works mid-turn, `smoke.sh` Phase 75); and the **view
+dispatch matches on something (`hooks::event_has_matchers` — `Stop`,
+`UserPromptSubmit` and `Interrupt` skip it), an integration's handlers
+labelled `Integration` with their `hooks.d/` file as the detail's source,
+the detail page's rounded box holding the real
+command word-wrapped, works mid-turn, `smoke.sh` Phase 75); and the **herdr
+integration** (`docs/herdr.md`: herdr is a terminal multiplexer for coding
+agents whose sidebar shows each agent `working`/`blocked`/`idle`, and
+Alter Zero reports its own state through herdr's documented vendor route —
+**entirely through the hooks**. `alter-zero integration install herdr`
+(`cli::IntegrationCli`, routed pre-TUI like `mcp`, `tui::integration_cli`)
+writes `hooks.d/herdr.json` whole, every event's group running one `sh`
+line that exits unless `HERDR_ENV=1` and otherwise `exec`s
+`"$ALTER_ZERO_BIN_PATH" integration hook herdr` — the reporter, which reads
+the payload, takes the pane's state file
+(`{config_home}/herdr/{fnv(socket, pane)}.json`) under `File::lock`, steps
+the pure `herdr::step` state machine — the lead's turn as a flag, the
+prompts waiting on the user as a **set** of call ids, since parallel
+agents ask at once, `blocked` > `working` > `idle`, a subagent never moving
+the turn — and sends `pane.report_agent` (with `agent_session_id` and a
+validated `resume_argv` = `alter-zero --resume {id}` once the conversation
+has a rollout) or, at a real quit, `pane.release_agent` over the Unix
+socket, `seq` a strictly rising nanosecond stamp; it prints nothing and
+always exits `0`, since a hook's stdout is model context and exit 2 a
+block. A terminal the agent's own tools run carries `ALTER_ZERO_AGENT=1`
+(`pty::spawn`), so an Alter Zero started there reports nothing — codex's
+`CODEX_THREAD_ID` guard. `tests/herdr_reporter.rs` drives the real binary
+against a stub socket, `smoke.sh` Phase 132 the whole loop); and the **view
 flow** (`docs/view-flow.md`: a content-driven framed view's page taller than
 the terminal — an `/mcp` tool detail's long description, a `/hooks` detail's
 wrapped command box, a `/trust` review's verbatim listing — no longer clips
@@ -3273,6 +3324,10 @@ but bug fixes still get a failing test first (TDD applies to fixes too).
   expresses — is the wrong change. Anything a hook must **block** on runs on
   the backend's own thread and **must poll the turn's `CancelToken`** on the
   20 ms cadence, or Esc silently stops working for as long as the hook takes.
+  An event the **boundary** fires (or one that must keep its order against
+  one) goes on the hooks' lane — `CommandHooks::fire_*` → `HookLane` — with
+  its payload pinned when fired; never run inline on the UI thread, and
+  never let it race a backend dispatch (`docs/hooks.md` *The lane*).
 - **A picture is reserved in `ui` and drawn at the boundary** (`docs/images.md`).
   Pure line builders never open an image file: they call `images::place` and
   emit marked blank rows, and `ImageStore::stamp` turns them into a picture in

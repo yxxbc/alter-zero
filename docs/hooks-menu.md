@@ -45,13 +45,17 @@ A tiny stack machine (`app::HooksLevel`), Esc popping one frame at a time:
 
 1. **Events** — `Hooks` over `{N} hook(s) configured`, the read-only info
    line (`ℹ This menu is read-only. To add or modify hooks, edit hooks.json
-   directly or ask alter-zero. See docs/hooks.md`), and the **eleven**
+   directly or ask alter-zero. See docs/hooks.md`), and the **sixteen**
    [`HookEvent`]s as numbered rows — `{n}.  {Event} ({count})` with the
    count in the selection accent (dropped at zero, Claude Code's shape) and
-   the event's one-line summary in an aligned description column. When the
-   file holds runnable hooks but the session has them off (`/settings`,
-   `ALTER_ZERO_HOOKS=0`), a red-ish note says so — the reference's
-   "restricted by policy" slot.
+   the event's one-line summary in an aligned description column. Digits
+   jump to the first nine; the rest are a walk with ↓. When `hooks.json`
+   holds runnable hooks but the session has them off (`/settings`), a
+   red-ish note says so — `Hooks in hooks.json are off this session —
+   enable them in /settings`, the reference's "restricted by policy" slot.
+   It names the file because an **integration's** hooks (`hooks.d/`,
+   `docs/hooks.md`) run regardless: a note saying *hooks are off* above an
+   integration that is running would be false.
 2. **Matchers** — `{Event} - Matchers` over the event's multi-line
    description (stdin payload + exit-code semantics, **as this runner
    implements them**), then one row per configured matcher group —
@@ -62,10 +66,12 @@ A tiny stack machine (`app::HooksLevel`), Esc popping one frame at a time:
    `{Event}`), the same event description, then one row per handler —
    `{n}. [{type}] {command}` (the handler's `statusMessage` stands in for
    the command when set, Claude Code's `getHookDisplayText`) with
-   `User Settings` in the description column.
+   `User Settings` in the description column — or `Integration` for a
+   handler a `hooks.d/` file contributed.
 4. **Hook details** — `Hook details` over an aligned field block (`Event:` /
    `Matcher:` (only when the event matches on something) / `Type:` /
-   `Source:  User settings ({hooks.json path})`), the `Command:` label over
+   `Source:  User settings ({hooks.json path})`, or `Integration
+   ({hooks.d/ file})` for an integration's), the `Command:` label over
    a rounded dim-bordered box holding the **real** command word-wrapped
    (`ui::wrap_output`, spaces preserved — `statusMessage` never stands in
    here), a `Status message:` line when one is set, and the closing
@@ -99,8 +105,10 @@ An event shows the matcher level exactly when our dispatch passes a match
 query for it (`hooks::event_has_matchers`, mirroring `llm/hooks.rs`): the
 tool events match the **tool name**, `SubagentStart`/`SubagentStop` the
 **agent type**, `SessionStart` the **source**, `SessionEnd` the **reason**,
-`PreCompact`/`PostCompact` the **trigger**. `Stop` and `UserPromptSubmit`
-match on nothing — their groups run matcher-or-not — so Enter on them skips
+`PreCompact`/`PostCompact` the **trigger**, `StopFailure` the **error
+type**, `Notification` the **notification type**. `Stop`,
+`UserPromptSubmit` and `Interrupt` match on nothing — their groups run
+matcher-or-not — so Enter on them skips
 straight to level 3 (every handler of the event, flattened), and their
 detail page shows no `Matcher:` row: a matcher the engine ignores must not
 be presented as if it filtered.
@@ -110,18 +118,23 @@ The per-event summary/description strings (`hooks::event_summary` /
 blocks with stderr as the reason, exit `0` + stdout JSON is a verdict, other
 exits are non-blocking, blocks ignored where the engine ignores them
 (`SessionStart`, `SubagentStart`), fire-and-forget where the outcome is
-discarded (`PostCompact`, `SessionEnd`) — not the reference's, whose exit
-codes mean different things.
+discarded (`PostCompact`, `SessionEnd`, and the observations — `Notification`,
+`PermissionResult`, `StopFailure`, `Interrupt`) — not the reference's, whose
+exit codes mean different things.
 
 ## The pure/boundary split
 
 - **`hooks::overview`** (pure): `HooksOverview::from_file` digests a parsed
-  [`HooksFile`] into the display tree — all eleven events in registry order,
+  [`HooksFile`] into the display tree — all sixteen events in registry order,
   each with its matcher groups merged by matcher string (config order kept)
   and every handler (any `type`, the skipped kinds included: they are
   *configured*, which is what a browser reports) resolved to
   `{kind, content, status_message}`. Events the file names that we don't
   model never show (the reference iterates its own registry the same way).
+  `with_integration(file, path)` folds a `hooks.d/` file in after it, each
+  handler keeping the file it came from (`origin`) for its label and its
+  `Source:` row; `user_total` counts the user's own, which is what the off
+  note is about.
 - **`app::hooks_menu`** (pure state): the open menu — the overview snapshot,
   the `Source:` path string, the enabled flag, and the level stack — plus
   `on_key_hooks`. Opening is `App::open_hooks_menu(overview, source,
@@ -138,7 +151,8 @@ codes mean different things.
   headline is the row that answers "where am I?".
 - **`tui`** (boundary): the `Action::OpenHooksMenu` arm derives the overview
   from the live `HookSetup` (the same `Arc<HooksFile>` every backend rebuild
-  re-attaches, so the browser and the runner can never disagree), resolves
+  re-attaches, plus each integration file the session loaded, so the
+  browser and the runner can never disagree), resolves
   the display path (`llm::hooks::hooks_file_path` → `ui::display_cwd`
   ~-shortening), reads the live enabled flag, and hands all three to `App`.
   The `/resume`-picker pattern: the pure command returns the intent, the
@@ -151,7 +165,8 @@ startup toast (`docs/hooks.md`) carries the actual error.
 ## What this deliberately is not
 
 No editing, no reloading (the overview is snapshotted at open, exactly as
-the runner snapshotted the file at startup), no project-level sources (one
-file → one `[User]` tag, `User Settings`, `User settings ({path})`), and no
-new `StreamEvent`/`HistoryItem` — the menu is UI over config, never
-conversation.
+the runner snapshotted the files at startup), no separate project-level
+source (a trusted project file is merged into the user's before the menu
+sees it: one `[User]` tag, `User Settings`, `User settings ({path})` — only
+an integration's file is told apart), and no new `StreamEvent`/
+`HistoryItem` — the menu is UI over config, never conversation.

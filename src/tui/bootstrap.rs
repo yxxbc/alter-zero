@@ -332,6 +332,19 @@ impl<'t> Session<'t> {
         // untrusted or unparseable project file contributes nothing). The
         // user layer is kept apart on the session so a /trust decision can
         // rebuild this merge live.
+        // The integration layer (docs/herdr.md): `hooks.d/*.json`, whose
+        // hooks run in every directory — unless `ALTER_ZERO_HOOKS` turns
+        // every hook off for the run. A file that will not parse is a toast
+        // naming it; the rest still load.
+        let (hook_integrations, hook_integration_errors) = if config::hooks_forbidden() {
+            (Vec::new(), Vec::new())
+        } else {
+            config::load_hook_integrations(config::hook_integrations_dir().as_deref())
+        };
+        let integrations_merged = hook_integrations.iter().fold(
+            alter_zero::hooks::HooksFile::default(),
+            |merged, (_, file)| merged.merged(file),
+        );
         let user_hooks_file = hooks_file.clone();
         let hooks_file = match project_layer
             .as_ref()
@@ -340,13 +353,15 @@ impl<'t> Session<'t> {
             Some(project_hooks) => user_hooks_file.merged(project_hooks),
             None => hooks_file,
         };
-        // The rollout path is created lazily on the first recorded item, so
-        // the payloads' `transcript_path` rides a shared cell the recorder
-        // publishes into (below) and the sink reads at dispatch time. The
-        // rest of the live handles ride beside it: the gate (a Shift+Tab cycle
-        // reaches the very next payload), the SessionStart source queue —
-        // seeded with `startup`, drained codex-style at the first turn's top
-        // so nothing blocks the first paint — and the synthetic-turn mark.
+        // The conversation's id and rollout path move — a fresh id on
+        // `/clear`, the adopted file's on `/resume`, a path only once the
+        // first item is recorded — so the payloads' `session_id` and
+        // `transcript_path` ride a shared cell the recorder publishes into
+        // (below) and the sink reads at dispatch time. The rest of the live
+        // handles ride beside it: the gate (a Shift+Tab cycle reaches the
+        // very next payload), the SessionStart source queue — seeded with
+        // `startup`, fired on the hooks' lane once the first frame is up so
+        // nothing blocks it — and the synthetic-turn mark.
         let hook_handles = alter_zero::llm::hooks::HookHandles {
             gate: permissions.gate().cloned(),
             ..alter_zero::llm::hooks::HookHandles::default()
@@ -354,7 +369,7 @@ impl<'t> Session<'t> {
         if let Ok(mut sources) = hook_handles.sources.lock() {
             sources.push("startup".to_string());
         }
-        let hook_transcript = hook_handles.transcript.clone();
+        let hook_conversation = hook_handles.conversation.clone();
         // Constructed even over an empty merge (docs/project-config.md): a
         // /trust approval mid-session swaps its file in place, and the live
         // handles must be THESE — a second set would split the transcript
@@ -371,6 +386,10 @@ impl<'t> Session<'t> {
             // `ALTER_ZERO_HOOKS` already merged over it for this run.
             enabled: settings.hooks,
             handles: hook_handles,
+            // The payloads' `scratchpad_dir` (docs/hooks.md).
+            scratchpad_dir: scratchpad_dir.clone(),
+            integrations: hook_integrations,
+            integrations_merged: std::sync::Arc::new(integrations_merged),
         });
 
         // The mid-turn message queue (docs/queue.md): what the user types
@@ -421,17 +440,21 @@ impl<'t> Session<'t> {
 
         // The /resume session recorder (docs/resume.md): mirrors App::history to a
         // rollout file, lazily created on the first recorded item so empty
-        // sessions never touch disk. It publishes the rollout path into the
-        // hooks' transcript cell whenever the active file changes
-        // (docs/hooks.md).
+        // sessions never touch disk. It publishes the conversation's id and
+        // rollout path into the hooks' cell whenever the conversation
+        // changes (docs/hooks.md).
         // …and it carries the session's own model selection, which the file's
         // `model` line records for a resume (docs/session-model.md).
+        // The first conversation takes the session's startup id, so a fresh
+        // session's rollout, temp tree and hook payloads share one id
+        // (docs/hooks.md).
         let recorder = SessionRecorder::new(
             &models.model_name(),
             models.session_selection().cloned(),
             &cwd,
+            session_id.clone(),
         )
-        .with_transcript(hook_transcript);
+        .with_conversation(hook_conversation);
         // The filesystem checkpoint store (docs/checkpoint.md): an isolated git
         // object store — never the user's real .git — that snapshots the whole cwd
         // per turn so a /resume or Esc-Esc backtrack can reset the code, not just
@@ -561,6 +584,9 @@ impl<'t> Session<'t> {
         // After the checkpoint toast, so a session with both problems ends up
         // showing the hooks one — the actionable typo beats the size refusal.
         session.report_hooks_error(hooks_error);
+        for error in hook_integration_errors {
+            session.report_hooks_error(Some(error));
+        }
         session.report_skill_errors(&skill_errors);
         session.report_agent_errors(&agent_errors);
         session.report_mcp_errors();
@@ -571,6 +597,11 @@ impl<'t> Session<'t> {
         // the directory's entry, or a resumed conversation's own.
         session.spawn_pending_probe();
         session.paint_first_frame(picker)?;
+        // SessionStart (docs/hooks.md): `startup` — or `resume` for a
+        // `--continue`/`--resume` boot, whose file the recorder adopted above
+        // — fired now, in the background, so a session tracker hears of the
+        // session at launch (docs/herdr.md). The first turn waits for it.
+        session.models.fire_session_start();
         // The day's anonymous usage ping (docs/telemetry.md), AFTER the first
         // frame is queued so it can never delay it: the install id is minted
         // if this is the first launch, the one-time notice is committed under
@@ -883,11 +914,19 @@ impl<'t> Session<'t> {
         // change.
         self.recorder
             .sync(&self.app.history, self.app.history_generation());
-        // SessionEnd (docs/hooks.md): fired before the teardown below, under
-        // the sink's own 2 s budget, so a quit never hangs on a hook. Claude
-        // Code's closest reason for an interactive quit is
-        // `prompt_input_exit`.
-        self.models.fire_session_end("prompt_input_exit");
+        // A turn still running ends before the session does: cancelled now
+        // (the reap below is unchanged), so its hooks are reaped ahead of
+        // SessionEnd, which waits for them — none lands after it
+        // (docs/hooks.md *The lane*; a tracker would hear *working* from a
+        // session that had released its pane, docs/herdr.md).
+        if let Some((cancel, _)) = &self.inflight {
+            cancel.cancel();
+        }
+        // SessionEnd (docs/hooks.md): fired before the teardown below and
+        // waited for under its bounded budget, whatever the hooks' lane still
+        // held dropped first — so a quit never hangs on a hook. Claude Code's
+        // closest reason for an interactive quit is `prompt_input_exit`.
+        self.models.end_session_at_exit();
         let inputs = self.app.take_unpersisted_inputs();
         self.hist_store.append(&inputs);
         // …and the tip walk's position, for a quit that drew a tip on its way

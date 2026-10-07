@@ -3,8 +3,9 @@
 use super::*;
 use crate::hooks::{HooksFile, HooksOverview};
 use crate::ui::theme::{
-    HOOKS_DETAIL_HINT, HOOKS_DISABLED_NOTE, HOOKS_EMPTY, HOOKS_HINT, HOOKS_MARKER,
-    HOOKS_MENU_MAX_ROWS, model_meta_color, model_selected_color,
+    HOOKS_DETAIL_HINT, HOOKS_DISABLED_NOTE, HOOKS_EMPTY, HOOKS_HINT, HOOKS_INTEGRATION_HEADER,
+    HOOKS_INTEGRATION_LABEL, HOOKS_MARKER, HOOKS_MENU_MAX_ROWS, model_meta_color,
+    model_selected_color,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -39,6 +40,19 @@ fn hooks_app() -> App {
 
 fn press(app: &mut App, code: KeyCode) {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+/// Walk the events list down to Stop and open it — by its position in the
+/// registry rather than a digit, since it sits past the nine a digit reaches.
+fn open_stop(app: &mut App) {
+    let stop = crate::hooks::HookEvent::ALL
+        .iter()
+        .position(|&event| event == crate::hooks::HookEvent::Stop)
+        .expect("Stop is modelled");
+    for _ in 0..stop {
+        press(app, KeyCode::Down);
+    }
+    press(app, KeyCode::Enter);
 }
 
 /// The built body as trimmed plain rows.
@@ -215,7 +229,7 @@ fn the_hooks_level_lists_handlers_with_the_source_header() {
 #[test]
 fn a_matcherless_event_titles_bare_and_descends_straight_to_its_hooks() {
     let mut app = hooks_app();
-    press(&mut app, KeyCode::Char('7')); // Stop
+    open_stop(&mut app);
     let texts = texts(&app, 90);
     assert_eq!(texts[2], "  Stop", "no `- Matcher:` suffix");
     assert!(texts.iter().any(|l| l.contains("[command] ./done.sh")));
@@ -291,7 +305,7 @@ fn the_detail_page_shows_fields_the_boxed_command_and_the_note() {
 #[test]
 fn a_matcherless_detail_omits_the_matcher_row() {
     let mut app = hooks_app();
-    press(&mut app, KeyCode::Char('7')); // Stop → hooks
+    open_stop(&mut app); // Stop → hooks
     press(&mut app, KeyCode::Enter); // its one hook's details
     let texts = texts(&app, 78);
     assert_eq!(texts[4], "  Event:    Stop");
@@ -371,6 +385,69 @@ fn the_disabled_note_shows_only_when_configured_hooks_are_off() {
             .iter()
             .any(|l| l.contains("0 hooks configured"))
     );
+}
+
+#[test]
+fn an_integration_hook_names_its_file_and_never_reads_as_off() {
+    // `hooks.d/` (docs/herdr.md): an integration runs in every directory,
+    // so with the user's own layer off and nothing in it, there is nothing
+    // to warn about — and its hook says where it came from.
+    let integration = HooksFile::parse(
+        r#"{"hooks":{"Interrupt":[{"hooks":[{"type":"command","command":"report idle"}]}]}}"#,
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.open_hooks_menu(
+        HooksOverview::from_file(&HooksFile::default())
+            .with_integration(&integration, "~/.alter-zero/hooks.d/herdr.json"),
+        Some("~/.alter-zero/hooks.json".into()),
+        false,
+    );
+    let top = texts(&app, 90);
+    assert!(
+        !top.iter().any(|l| l.contains(HOOKS_DISABLED_NOTE)),
+        "an integration is never off here: {top:#?}"
+    );
+    assert!(top.iter().any(|l| l.contains("1 hook configured")));
+
+    let interrupt = crate::hooks::HookEvent::ALL
+        .iter()
+        .position(|&event| event == crate::hooks::HookEvent::Interrupt)
+        .expect("Interrupt is modelled");
+    for _ in 0..interrupt {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter); // matcher-less: straight to its hooks
+    let list = texts(&app, 90);
+    let row = find(&list, "[command] report idle");
+    assert!(
+        list[row].contains(HOOKS_INTEGRATION_HEADER),
+        "{:?}",
+        list[row]
+    );
+    press(&mut app, KeyCode::Enter); // the hook's details
+    let detail = texts(&app, 90);
+    assert!(
+        detail.contains(&format!(
+            "  Source:   {HOOKS_INTEGRATION_LABEL} (~/.alter-zero/hooks.d/herdr.json)"
+        )),
+        "{detail:#?}"
+    );
+}
+
+#[test]
+fn the_off_note_counts_the_users_hooks_beside_a_running_integration() {
+    let integration = HooksFile::parse(
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"report idle"}]}]}}"#,
+    )
+    .unwrap();
+    let mut app = App::new();
+    app.open_hooks_menu(
+        overview().with_integration(&integration, "~/.alter-zero/hooks.d/herdr.json"),
+        None,
+        false,
+    );
+    find(&texts(&app, 90), HOOKS_DISABLED_NOTE);
 }
 
 #[test]
