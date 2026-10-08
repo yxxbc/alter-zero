@@ -84,6 +84,19 @@ release heading when a version is cut.
 
 ### Fixed
 
+- **Pictures in a herdr pane are drawn as real images.** herdr's panes say
+  `xterm-256color` and nothing about graphics, so every picture there fell
+  back to coarse half-block characters, though herdr's terminal draws kitty
+  graphics. Where the environment names no graphics protocol, Alter Zero now
+  asks the terminal at startup, in the same read that already finds the
+  cursor, and uses the kitty protocol when the terminal says yes. A terminal
+  that says nothing keeps half-blocks, and WezTerm and Konsole, which say
+  yes but cannot show these pictures, are recognised by the name they give.
+  Nothing is asked under tmux, screen or zellij, or when
+  `ALTER_ZERO_IMAGE_PROTOCOL` is set, and anything typed while Alter Zero
+  starts still reaches the prompt. GNU screen and zellij are now recognised
+  as multiplexers the way tmux is, so an outer terminal's variables no
+  longer choose the protocol inside them (`docs/images.md`).
 - **Ending a session no longer freezes the screen while its hooks run.**
   `/clear` ran `SessionEnd` hooks on the UI thread for up to two seconds.
   The session's start and end events, and the new interrupt event, now run

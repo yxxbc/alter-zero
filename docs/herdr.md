@@ -298,6 +298,23 @@ in a pane* — codex's `CODEX_THREAD_ID` guard, for the same reason.
 `alter-zero integration status` says which of the three a terminal is: a
 pane, a pane's agent terminal, or neither.
 
+## Pictures in a pane
+
+Separate from the hooks, and needing no install: a herdr pane draws Alter
+Zero's pictures (a pasted screenshot, an image `read`) as kitty graphics.
+herdr's emulator is libghostty, which speaks the kitty graphics protocol, but
+a pane's environment names none of it — `TERM=xterm-256color`,
+`TERM_PROGRAM=herdr`, and the outer terminal's `KITTY_WINDOW_ID` stripped — so
+detection by environment alone fell to half-blocks there. Where the
+environment names nothing, Alter Zero asks the terminal inside its startup
+cursor query, and herdr answers `OK` and calls itself `libghostty`
+(`docs/images.md` *Asking the terminal*). herdr's `kitty_graphics` setting has
+been on by default since 0.9.0; with it off, herdr says nothing and the
+pictures stay half-blocks. herdr then draws the picture on its own outer
+terminal, so what an outer terminal without kitty graphics shows is herdr's
+call; `terminal.kitty_graphics = false` in herdr's config, or
+`ALTER_ZERO_IMAGE_PROTOCOL=halfblocks` in the pane, keeps half-blocks there.
+
 ## Known gaps
 
 - **The offline demo fires no hooks** (`docs/hooks.md`), so neither does this:
